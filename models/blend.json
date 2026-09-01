@@ -1,0 +1,11 @@
+{
+  "per_position_direct_weight": {
+    "GKP": 0.15,
+    "DEF": 0.2,
+    "MID": 0.45,
+    "FWD": 0.5
+  },
+  "formula": "xpts = (1 - w[pos]) * multibucket + w[pos] * direct",
+  "output_clip_min": 0.0,
+  "note": "Fitted on the held-out slice by the ranking objective. Learned GKP direct weight: 0.15."
+}
