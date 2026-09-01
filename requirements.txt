@@ -1,3 +1,8 @@
 Flask==3.1.2
 gunicorn==23.0.0
 requests==2.32.3
+pandas
+pyarrow
+numpy
+xgboost==3.2.0
+scikit-learn
