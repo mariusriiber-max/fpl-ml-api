@@ -1,3 +1,4 @@
+from dastan import predictor
 from flask import Flask, jsonify, request
 import requests
 
@@ -86,7 +87,30 @@ def players():
             "status": "error",
             "error": str(e)
         }), 500
+@app.route("/ml-health")
+def ml_health():
+    try:
+        model = predictor.Dastan()
 
+        # Load one real model artifact to verify that
+        # Dastan + model files + XGBoost work correctly.
+        model._load("p60_MID")
+
+        return jsonify({
+            "status": "ok",
+            "model": "Dastan",
+            "model_loaded": True,
+            "feature_count": len(model.features),
+            "message": "Dastan model and weights loaded successfully."
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "model": "Dastan",
+            "model_loaded": False,
+            "error": str(e)
+        }), 500
 
 @app.route("/predictions")
 def predictions():
