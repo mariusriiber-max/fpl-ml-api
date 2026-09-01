@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import os
 import json
 import re
 import time
@@ -31,6 +32,10 @@ VAASTAV_TREE = (
     f"{VAASTAV_COMMIT}?recursive=1"
 )
 USER_AGENT = {"User-Agent": "dastan-data-rebuild/1.0"}
+github_token = os.getenv("GITHUB_TOKEN")
+
+if github_token:
+    USER_AGENT["Authorization"] = f"Bearer {github_token}"
 CORE_FILES = ("gws/merged_gw.csv", "players_raw.csv", "teams.csv")
 POSITION_VALUES = {"GK", "GKP", "DEF", "MID", "FWD"}
 
