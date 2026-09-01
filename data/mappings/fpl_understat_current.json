@@ -1,0 +1,9 @@
+{
+  "season": "2026-27",
+  "captured_at": "2026-08-10T20:34:17.046380+00:00",
+  "source": "https://fantasy.premierleague.com/api/bootstrap-static/",
+  "bootstrap_sha256": "374454bc3cc48d25bf0a7bd55f5753b298cca8d45db683cd3ec81de129c6c42b",
+  "roster_sha256": "2ba9f311fa2d16c26e3f6e7e9086ee0c6593d76154b43e46ea7d820e591e2c94",
+  "players": 577,
+  "note": "Roster snapshot only; identities are joined from the versioned SmartPlayFPL operational mapping release."
+}
