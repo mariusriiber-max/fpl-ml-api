@@ -1,3 +1,5 @@
+from pathlib import Path
+from dastan.rebuild import sources, features
 from dastan import predictor
 from flask import Flask, jsonify, request
 import requests
@@ -111,7 +113,55 @@ def ml_health():
             "model_loaded": False,
             "error": str(e)
         }), 500
+from pathlib import Path
+from dastan.rebuild import sources, features
 
+
+@app.route("/pipeline-test")
+def pipeline_test():
+    try:
+        root = Path(__file__).resolve().parent
+        raw_dir = root / ".cache" / "dastan-raw"
+
+        # Start with the latest completed season only.
+        seasons = ["2025-26"]
+
+        sources.download_sources(
+            raw_dir=raw_dir,
+            seasons=seasons,
+            workers=4,
+            force=False,
+            allow_missing_understat=True
+        )
+
+        player_matches, team_matches, player_lookup = (
+            sources.build_canonical_matches(raw_dir, seasons)
+        )
+
+        frame = features.build_feature_frame(
+            player_matches,
+            team_matches
+        )
+
+        model = predictor.Dastan()
+        out = model.predict_frame(frame, with_parts=True)
+
+        return jsonify({
+            "status": "ok",
+            "seasons": seasons,
+            "player_match_rows": len(player_matches),
+            "team_match_rows": len(team_matches),
+            "feature_rows": len(frame),
+            "feature_columns": len(frame.columns),
+            "prediction_rows": len(out),
+            "model_features": len(model.features)
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
 @app.route("/predictions")
 def predictions():
 
