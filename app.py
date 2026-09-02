@@ -115,7 +115,8 @@ def ml_health():
 
 @app.route("/pipeline-test")
 def pipeline_test():
-        from dastan.rebuild import sources, features
+    from dastan.rebuild import sources, features
+
     try:
         root = Path(__file__).resolve().parent
         raw_dir = root / ".cache" / "dastan-raw"
