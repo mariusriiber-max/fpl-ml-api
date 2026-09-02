@@ -1,5 +1,4 @@
 from pathlib import Path
-from dastan.rebuild import sources, features
 from dastan import predictor
 from flask import Flask, jsonify, request
 import requests
@@ -113,12 +112,10 @@ def ml_health():
             "model_loaded": False,
             "error": str(e)
         }), 500
-from pathlib import Path
-from dastan.rebuild import sources, features
-
 
 @app.route("/pipeline-test")
 def pipeline_test():
+        from dastan.rebuild import sources, features
     try:
         root = Path(__file__).resolve().parent
         raw_dir = root / ".cache" / "dastan-raw"
