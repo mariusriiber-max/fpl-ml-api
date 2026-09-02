@@ -234,6 +234,7 @@ def _fetch_understat_fallbacks(
 ) -> None:
     if not missing_players and not missing_team_seasons:
         return
+
     try:
         from understatapi import UnderstatClient
     except ImportError as exc:
@@ -242,11 +243,13 @@ def _fetch_understat_fallbacks(
         ) from exc
 
     failures: list[str] = []
-with UnderstatClient() as client:
+
+    with UnderstatClient() as client:
         for index, player_id in enumerate(missing_players, 1):
             path = raw_dir / "understat" / "players" / f"{player_id}.json"
             if path.exists() and path.stat().st_size and not force:
                 continue
+
             payload = None
             for attempt in range(3):
                 try:
@@ -254,24 +257,30 @@ with UnderstatClient() as client:
                     break
                 except Exception:
                     time.sleep(2**attempt)
+
             if payload is None:
                 failures.append(f"player:{player_id}")
                 continue
+
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
-                json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
+                json.dumps(payload, ensure_ascii=False) + "\n",
+                encoding="utf-8",
             )
+
             if index % 25 == 0:
                 print(
-                    f"    Understat fallback players {index:,}/{len(missing_players):,}",
+                    f"  Understat fallback players {index:,}/{len(missing_players):,}",
                     flush=True,
                 )
+
             time.sleep(0.15)
 
         for season in missing_team_seasons:
             path = raw_dir / "understat" / "teams" / f"{season}.json"
             if path.exists() and path.stat().st_size and not force:
                 continue
+
             payload = None
             for attempt in range(3):
                 try:
@@ -281,19 +290,23 @@ with UnderstatClient() as client:
                     break
                 except Exception:
                     time.sleep(2**attempt)
+
             if not payload:
                 failures.append(f"teams:{season}")
                 continue
+
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
-                json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
+                json.dumps(payload, ensure_ascii=False) + "\n",
+                encoding="utf-8",
             )
 
-      if failures and not allow_missing:
+    if failures and not allow_missing:
         raise RuntimeError(
             f"Understat could not resolve {len(failures)} sources: {failures[:10]}; "
             "rerun or pass --allow-missing-understat"
         )
+
     if failures:
         print(f"  WARNING: {len(failures)} Understat fallbacks remain missing")
 def write_download_manifest(raw_dir: Path, seasons: list[str]) -> Path:
