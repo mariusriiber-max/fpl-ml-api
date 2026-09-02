@@ -541,9 +541,22 @@ def build_feature_frame(
         validate="many_to_one",
     ).drop(columns=["understat_team", "_merge_date"], errors="ignore")
 
-    print("  computing Dastan feature families", flush=True)
-    frame = add_availability_features(frame)
-    frame["is_home_num"] = frame["is_home"].astype(int)
+    print(
+    f"  computing Dastan feature families: "
+    f"{len(frame):,} rows x {len(frame.columns):,} cols, "
+    f"{frame.memory_usage(deep=True).sum() / 1024**2:.1f} MB",
+    flush=True,
+)
+
+print("  -> add_availability_features START", flush=True)
+frame = add_availability_features(frame)
+print(
+    f"  -> add_availability_features DONE "
+    f"({frame.memory_usage(deep=True).sum() / 1024**2:.1f} MB)",
+    flush=True,
+)
+
+frame["is_home_num"] = frame["is_home"].astype(int)
     for column in ("status_league_rank", "opp_status_league_rank"):
         if column not in frame:
             frame[column] = np.nan
@@ -551,7 +564,13 @@ def build_feature_frame(
     frame["target_minutes_ge60"] = frame["minutes"].ge(60).astype(int)
     frame["target_bucket"] = _assign_bucket(frame["target_points"])
     frame = frame.rename(columns={"clearances_blocks_interceptions": "cbit"})
-    frame = add_dastan_features(frame)
+    print("  -> add_dastan_features START", flush=True)
+frame = add_dastan_features(frame)
+print(
+    f"  -> add_dastan_features DONE "
+    f"({frame.memory_usage(deep=True).sum() / 1024**2:.1f} MB)",
+    flush=True,
+)
     frame = data.anchor_to_deadline(frame)
     data.assert_deadline_anchored(frame)
 
