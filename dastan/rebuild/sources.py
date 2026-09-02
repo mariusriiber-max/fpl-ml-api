@@ -243,7 +243,6 @@ def _fetch_understat_fallbacks(
 
     failures: list[str] = []
 with UnderstatClient() as client:
-try:
         for index, player_id in enumerate(missing_players, 1):
             path = raw_dir / "understat" / "players" / f"{player_id}.json"
             if path.exists() and path.stat().st_size and not force:
