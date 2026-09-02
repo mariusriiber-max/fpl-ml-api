@@ -555,25 +555,26 @@ print(
     f"({frame.memory_usage(deep=True).sum() / 1024**2:.1f} MB)",
     flush=True,
 )
-
-frame["is_home_num"] = frame["is_home"].astype(int)
+    frame["is_home_num"] = frame["is_home"].astype(int)
     for column in ("status_league_rank", "opp_status_league_rank"):
         if column not in frame:
             frame[column] = np.nan
+
     frame["target_points"] = frame["total_points"].fillna(0.0)
     frame["target_minutes_ge60"] = frame["minutes"].ge(60).astype(int)
     frame["target_bucket"] = _assign_bucket(frame["target_points"])
     frame = frame.rename(columns={"clearances_blocks_interceptions": "cbit"})
+
     print("  -> add_dastan_features START", flush=True)
-frame = add_dastan_features(frame)
-print(
-    f"  -> add_dastan_features DONE "
-    f"({frame.memory_usage(deep=True).sum() / 1024**2:.1f} MB)",
-    flush=True,
-)
+    frame = add_dastan_features(frame)
+    print(
+        "  -> add_dastan_features DONE "
+        f"({frame.memory_usage(deep=True).sum() / 1024**2:.1f} MB)",
+        flush=True,
+    )
+
     frame = data.anchor_to_deadline(frame)
     data.assert_deadline_anchored(frame)
-
     release_columns = list(pd.read_parquet(data.FRAME).columns)
     core_features = json.loads(
         (data.ROOT / "models" / "core_feature_cols.json").read_text()
