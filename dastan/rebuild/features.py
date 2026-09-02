@@ -576,9 +576,9 @@ print(
 frame = data.anchor_to_deadline(frame)
 data.assert_deadline_anchored(frame)
 release_columns = list(pd.read_parquet(data.FRAME).columns)
-    core_features = json.loads(
-        (data.ROOT / "models" / "core_feature_cols.json").read_text()
-    )
+core_features = json.loads(
+    (data.ROOT / "models" / "core_feature_cols.json").read_text()
+)
     for column in release_columns:
         if column not in frame:
             if column in core_features:
