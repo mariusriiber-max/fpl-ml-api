@@ -129,11 +129,10 @@ def ml_health():
 
 
 def run_pipeline():
-    from dastan.rebuild import sources, features
-
     global pipeline_state
 
     try:
+        from dastan.rebuild import sources, features
         with pipeline_lock:
             pipeline_state.update({
                 "status": "running",
