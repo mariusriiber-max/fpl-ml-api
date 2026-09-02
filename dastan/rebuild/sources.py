@@ -375,16 +375,16 @@ def download_sources(
         )
         for player_id, source in sorted(player_paths.items())
     ]
-try:
-    _download_many(player_jobs, workers=workers, force=force)
-except RuntimeError:
-    if not allow_missing_understat:
-        raise
-    print(
-        "  WARNING: one or more pinned Understat player files could not be downloaded; "
-        "continuing with live Understat fallbacks",
-        flush=True,
-    )
+    try:
+        _download_many(player_jobs, workers=workers, force=force)
+    except RuntimeError:
+        if not allow_missing_understat:
+            raise
+        print(
+            "  WARNING: one or more pinned Understat player files could not be downloaded; "
+            "continuing with live Understat fallbacks",
+            flush=True,
+        )
 
     team_jobs: list[tuple[str, Path]] = []
     local_team_paths: dict[str, list[Path]] = {}
