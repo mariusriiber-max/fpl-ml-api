@@ -289,14 +289,13 @@ with UnderstatClient() as client:
                 json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
             )
 
-            if failures and not allow_missing:
-            raise RuntimeError(
-                f"Understat could not resolve {len(failures)} sources: {failures[:10]}; "
-                "rerun or pass --allow-missing-understat"
-            )
-        if failures:
-            print(f"  WARNING: {len(failures)} Understat fallbacks remain missing")
-
+                if failures and not allow_missing:
+        raise RuntimeError(
+            f"Understat could not resolve {len(failures)} sources: {failures[:10]}; "
+            "rerun or pass --allow-missing-understat"
+        )
+    if failures:
+        print(f"  WARNING: {len(failures)} Understat fallbacks remain missing")
 
 def write_download_manifest(raw_dir: Path, seasons: list[str]) -> Path:
     files = {}
