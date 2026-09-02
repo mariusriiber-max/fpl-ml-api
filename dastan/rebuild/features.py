@@ -579,15 +579,15 @@ release_columns = list(pd.read_parquet(data.FRAME).columns)
 core_features = json.loads(
     (data.ROOT / "models" / "core_feature_cols.json").read_text()
 )
-    for column in release_columns:
-        if column not in frame:
-            if column in core_features:
-                frame[column] = 0.0
-            else:
-                raise RuntimeError(f"rebuilt frame is missing release column {column}")
-    # Preserve the player_uid/kickoff ordering used by the released training run.
-    # XGBoost is row-order sensitive even with a fixed seed.
-    return frame[release_columns].reset_index(drop=True)
+for column in release_columns:
+    if column not in frame:
+        if column in core_features:
+            frame[column] = 0.0
+        else:
+            raise RuntimeError(f"rebuilt frame is missing release column {column}")
+# Preserve the player_uid/kickoff ordering used by the released training run.
+# XGBoost is row-order sensitive even with a fixed seed.
+return frame[release_columns].reset_index(drop=True)
 
 
 def parse_ppda(value) -> tuple[float, float]:
