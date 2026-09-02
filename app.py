@@ -129,7 +129,7 @@ def pipeline_test():
         sources.download_sources(
             raw_dir=raw_dir,
             seasons=seasons,
-            workers=4,
+            workers=1,
             force=False,
             allow_missing_understat=True
         )
