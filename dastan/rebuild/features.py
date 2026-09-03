@@ -793,8 +793,21 @@ def build_feature_frame(
         flush=True,
     )
 
-    frame = data.anchor_to_deadline(frame)
-    data.assert_deadline_anchored(frame)
+    print(
+    "  -> anchor_to_deadline START "
+    f"({frame.memory_usage(deep=True).sum() / 1024**2:.1f} MB)",
+    flush=True,
+)
+
+frame = data.anchor_to_deadline(frame)
+
+print(
+    "  -> anchor_to_deadline DONE "
+    f"({frame.memory_usage(deep=True).sum() / 1024**2:.1f} MB)",
+    flush=True,
+)
+
+data.assert_deadline_anchored(frame)
     release_columns = list(pd.read_parquet(data.FRAME).columns)
     core_features = json.loads(
         (data.ROOT / "models" / "core_feature_cols.json").read_text()
