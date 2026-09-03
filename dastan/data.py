@@ -61,27 +61,27 @@ def anchor_to_deadline(df: pd.DataFrame, cols: list[str] | None = None) -> pd.Da
     cols = [c for c in cols if c in df.columns]
     if not cols:
         return df
-    tmp = df[["season", "gameweek", "fpl_code", "kickoff_time", *cols]].copy()
-tmp["_row_id"] = np.arange(len(tmp))
-
-tmp = tmp.sort_values(
-    ["season", "gameweek", "fpl_code", "kickoff_time"],
-    kind="mergesort",
-)
-
-tmp[cols] = tmp.groupby(
-    ["season", "gameweek", "fpl_code"],
-    sort=False,
-)[cols].transform("first")
-
-tmp = tmp.sort_values("_row_id", kind="mergesort")
-
-df.loc[:, cols] = tmp[cols].to_numpy(copy=False)
-
-del tmp
-gc.collect()
-
-return df
+        tmp = df[["season", "gameweek", "fpl_code", "kickoff_time", *cols]].copy()
+    tmp["_row_id"] = np.arange(len(tmp))
+    
+    tmp = tmp.sort_values(
+        ["season", "gameweek", "fpl_code", "kickoff_time"],
+        kind="mergesort",
+    )
+    
+    tmp[cols] = tmp.groupby(
+        ["season", "gameweek", "fpl_code"],
+        sort=False,
+    )[cols].transform("first")
+    
+    tmp = tmp.sort_values("_row_id", kind="mergesort")
+    
+    df.loc[:, cols] = tmp[cols].to_numpy(copy=False)
+    
+    del tmp
+    gc.collect()
+    
+    return df
 
 
 def assert_deadline_anchored(df: pd.DataFrame, cols: list[str] | None = None) -> None:
