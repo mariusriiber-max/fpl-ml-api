@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
-
+import gc
 from .seasons import load_registry
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,52 +35,43 @@ EXPECTED_ROWS = int(_REGISTRY["release_rows"])
 HISTORY_PREFIXES = ("player_", "team_", "ar_", "cx_", "p_any_", "p60_", "e_minutes_")
 
 
-def anchor_to_deadline(df: pd.DataFrame, cols: list[str] | None = None) -> pd.DataFrame:
-    """Give every fixture in a gameweek the history that existed at its deadline.
-
-    This is the least obvious source of leakage in the whole pipeline, and it is
-    worth understanding before trusting any FPL model, including this one.
-
-    Rolling features are normally built by shifting one row back in time, ordered by
-    kickoff. That correctly keeps a fixture out of its own feature vector. But FPL
-    squads are locked at a *deadline*, not at a kickoff, and in a double gameweek two
-    fixtures share one deadline. Sorted by kickoff, the second fixture's "previous
-    match" is the first fixture of the same gameweek -- a result nobody had seen when
-    the squad was picked. The model then learns from the answer key.
-
-    Measured on this frame: 6,958 player-gameweeks contain more than one fixture, and
-    **40.6% of them carried different rolling values across those fixtures** before
-    this fix.
-
-    The correction is to broadcast the earliest fixture's historical values across the
-    whole gameweek. That fixture's shifted window contains exactly the matches
-    completed before the deadline, so it is the right snapshot for every fixture in it.
-    """
+def anchor_to_deadline(
+    df: pd.DataFrame,
+    cols: list[str] | None = None,
+) -> pd.DataFrame:
     if cols is None:
         cols = [c for c in df.columns if c.startswith(HISTORY_PREFIXES)]
+
     cols = [c for c in cols if c in df.columns]
+
     if not cols:
         return df
-        tmp = df[["season", "gameweek", "fpl_code", "kickoff_time", *cols]].copy()
-    tmp["_row_id"] = np.arange(len(tmp))
-    
-    tmp = tmp.sort_values(
-        ["season", "gameweek", "fpl_code", "kickoff_time"],
-        kind="mergesort",
-    )
-    
-    tmp[cols] = tmp.groupby(
-        ["season", "gameweek", "fpl_code"],
-        sort=False,
-    )[cols].transform("first")
-    
-    tmp = tmp.sort_values("_row_id", kind="mergesort")
-    
-    df.loc[:, cols] = tmp[cols].to_numpy(copy=False)
-    
-    del tmp
-    gc.collect()
-    
+
+    keys = ["season", "gameweek", "fpl_code"]
+    sort_cols = ["season", "gameweek", "fpl_code", "kickoff_time"]
+
+    chunk_size = 20
+
+    for start in range(0, len(cols), chunk_size):
+        chunk = cols[start:start + chunk_size]
+
+        tmp = df[sort_cols + chunk].copy()
+        tmp["_row_id"] = np.arange(len(tmp), dtype=np.int32)
+
+        tmp = tmp.sort_values(sort_cols, kind="mergesort")
+
+        tmp[chunk] = (
+            tmp.groupby(keys, sort=False)[chunk]
+            .transform("first")
+        )
+
+        tmp = tmp.sort_values("_row_id", kind="mergesort")
+
+        df.loc[:, chunk] = tmp[chunk].to_numpy(copy=False)
+
+        del tmp
+        gc.collect()
+
     return df
 
 
