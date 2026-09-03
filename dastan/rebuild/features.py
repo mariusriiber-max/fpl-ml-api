@@ -317,108 +317,286 @@ def add_availability_features(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_dastan_features(frame: pd.DataFrame) -> pd.DataFrame:
-    out = frame.sort_values(["player_uid", "kickoff_time"], kind="mergesort").copy()
-    grouped = out.groupby("player_uid", sort=False)
+    """
+    Compute Dastan feature families with narrow temporary frames.
+
+    Avoid sorting/copying/merging the full wide feature frame, which can
+    cause large temporary memory spikes on Render's 512 MB instance.
+    """
+
+    # Frame is already in player/kickoff order after compute_player_rolling
+    # and the later left merges preserve that order.
+    needed = [
+        "player_uid",
+        "kickoff_time",
+        "position",
+        "defensive_contribution",
+        "cbit",
+        "recoveries",
+        "tackles",
+        "starts",
+        "season",
+        "team_name",
+        "opponent_team_name",
+        "fixture",
+    ]
+
+    tmp = frame[needed].copy()
+    tmp["_row_id"] = np.arange(len(tmp), dtype=np.int32)
+
+    tmp = tmp.sort_values(
+        ["player_uid", "kickoff_time"],
+        kind="mergesort",
+    )
+
+    grouped = tmp.groupby("player_uid", sort=False)
+
     source_names = {
         "defensive_contribution": "defensive_contribution",
         "cbit": "cbit",
         "recoveries": "recoveries",
         "tackles": "tackles",
     }
+
+    result_columns = []
+
     for source, feature in source_names.items():
-        for window in [3, 5, 10, 38]:
-            out[f"ar_{feature}_{window}"] = grouped[source].transform(
-                lambda values, w=window: values.shift(1)
+        for window in (3, 5, 10, 38):
+            name = f"ar_{feature}_{window}"
+            tmp[name] = grouped[source].transform(
+                lambda values, w=window: (
+                    values.shift(1)
+                    .rolling(w, min_periods=1)
+                    .mean()
+                )
+            ).astype(np.float32)
+            result_columns.append(name)
+
+    threshold = tmp["position"].map(DC_THRESHOLD).astype(float)
+
+    tmp["_dc_hit"] = (
+        tmp["defensive_contribution"]
+        .ge(threshold)
+        .astype(np.float32)
+    )
+
+    tmp["_dc_near"] = (
+        tmp["defensive_contribution"].ge(threshold - 3)
+        & tmp["defensive_contribution"].lt(threshold)
+    ).astype(np.float32)
+
+    missing_dc = tmp["defensive_contribution"].isna()
+    tmp.loc[missing_dc, ["_dc_hit", "_dc_near"]] = np.nan
+
+    grouped = tmp.groupby("player_uid", sort=False)
+
+    for window in (3, 5, 10):
+        hit_name = f"ar_dc_hit_rate_{window}"
+        near_name = f"ar_dc_near_rate_{window}"
+        starts_name = f"ar_starts_{window}"
+
+        tmp[hit_name] = grouped["_dc_hit"].transform(
+            lambda values, w=window: (
+                values.shift(1)
                 .rolling(w, min_periods=1)
                 .mean()
             )
+        ).astype(np.float32)
 
-    threshold = out["position"].map(DC_THRESHOLD).astype(float)
-    out["_dc_hit"] = out["defensive_contribution"].ge(threshold).astype(float)
-    out["_dc_near"] = (
-        out["defensive_contribution"].ge(threshold - 3)
-        & out["defensive_contribution"].lt(threshold)
-    ).astype(float)
-    out.loc[out["defensive_contribution"].isna(), ["_dc_hit", "_dc_near"]] = np.nan
-    grouped = out.groupby("player_uid", sort=False)
-    for window in [3, 5, 10]:
-        out[f"ar_dc_hit_rate_{window}"] = grouped["_dc_hit"].transform(
-            lambda values, w=window: values.shift(1).rolling(w, min_periods=1).mean()
+        tmp[near_name] = grouped["_dc_near"].transform(
+            lambda values, w=window: (
+                values.shift(1)
+                .rolling(w, min_periods=1)
+                .mean()
+            )
+        ).astype(np.float32)
+
+        tmp[starts_name] = grouped["starts"].transform(
+            lambda values, w=window: (
+                values.shift(1)
+                .rolling(w, min_periods=1)
+                .mean()
+            )
+        ).astype(np.float32)
+
+        result_columns.extend(
+            [hit_name, near_name, starts_name]
         )
-        out[f"ar_dc_near_rate_{window}"] = grouped["_dc_near"].transform(
-            lambda values, w=window: values.shift(1).rolling(w, min_periods=1).mean()
-        )
-        out[f"ar_starts_{window}"] = grouped["starts"].transform(
-            lambda values, w=window: values.shift(1).rolling(w, min_periods=1).mean()
-        )
-    out["ar_dc_ppg_5"] = 2.0 * out["ar_dc_hit_rate_5"]
-    out["ar_rest_days"] = (
-        (out["kickoff_time"] - grouped["kickoff_time"].shift(1))
+
+    tmp["ar_dc_ppg_5"] = (
+        2.0 * tmp["ar_dc_hit_rate_5"]
+    ).astype(np.float32)
+    result_columns.append("ar_dc_ppg_5")
+
+    tmp["ar_rest_days"] = (
+        (tmp["kickoff_time"] - grouped["kickoff_time"].shift(1))
         .dt.total_seconds()
         .div(86_400)
         .clip(1, 14)
         .fillna(14)
+        .astype(np.float32)
+    )
+    result_columns.append("ar_rest_days")
+
+    # Team fixture congestion using a narrow unique fixture table.
+    team_fixtures = (
+        tmp[["season", "team_name", "fixture", "kickoff_time"]]
+        .drop_duplicates(["season", "team_name", "fixture"])
+        .sort_values(
+            ["season", "team_name", "kickoff_time"],
+            kind="mergesort",
+        )
     )
 
-    team_fixtures = (
-        out[["season", "team_name", "fixture", "kickoff_time"]]
-        .drop_duplicates(["season", "team_name", "fixture"])
-        .sort_values(["season", "team_name", "kickoff_time"], kind="mergesort")
-    )
-    density = []
-    for _, rows in team_fixtures.groupby(["season", "team_name"], sort=False):
+    density_parts = []
+    fourteen_days = pd.Timedelta(days=14).value
+
+    for _, rows in team_fixtures.groupby(
+        ["season", "team_name"],
+        sort=False,
+    ):
         kickoffs = rows["kickoff_time"].astype("int64").to_numpy()
-        fourteen_days = pd.Timedelta(days=14).value
+
         values = [
-            int(((kickoffs[index] - kickoffs[:index]) <= fourteen_days).sum())
+            int(
+                (
+                    (kickoffs[index] - kickoffs[:index])
+                    <= fourteen_days
+                ).sum()
+            )
             for index in range(len(kickoffs))
         ]
-        density.append(pd.Series(values, index=rows.index))
-    team_fixtures["ar_team_matches_14d"] = pd.concat(density).sort_index()
-    out = _checked_merge(
-        out,
-        team_fixtures[["season", "team_name", "fixture", "ar_team_matches_14d"]],
-        "team congestion",
-        on=["season", "team_name", "fixture"],
-        validate="many_to_one",
+
+        density_parts.append(
+            pd.Series(
+                values,
+                index=rows.index,
+                dtype=np.float32,
+            )
+        )
+
+    if density_parts:
+        team_fixtures["ar_team_matches_14d"] = (
+            pd.concat(density_parts).sort_index()
+        )
+    else:
+        team_fixtures["ar_team_matches_14d"] = np.float32(0)
+
+    congestion_lookup = team_fixtures.set_index(
+        ["season", "team_name", "fixture"]
+    )["ar_team_matches_14d"]
+
+    congestion_keys = pd.MultiIndex.from_frame(
+        tmp[["season", "team_name", "fixture"]]
     )
 
+    tmp["ar_team_matches_14d"] = (
+        congestion_lookup
+        .reindex(congestion_keys)
+        .to_numpy(dtype=np.float32)
+    )
+    result_columns.append("ar_team_matches_14d")
+
+    del team_fixtures
+    del density_parts
+    del congestion_lookup
+    del congestion_keys
+    gc.collect()
+
+    # Opponent defensive contribution history.
     allowed = (
-        out.groupby(["season", "fixture", "team_name"], as_index=False)
+        tmp.groupby(
+            ["season", "fixture", "team_name"],
+            as_index=False,
+        )
         .agg(
             dc_sum=("defensive_contribution", "sum"),
             tackle_sum=("tackles", "sum"),
             conceding_team=("opponent_team_name", "first"),
             kickoff=("kickoff_time", "first"),
         )
-        .sort_values(["season", "conceding_team", "kickoff"], kind="mergesort")
-    )
-    grouped_allowed = allowed.groupby(["season", "conceding_team"], sort=False)
-    for window in [3, 5, 10]:
-        allowed[f"ar_opp_dc_allowed_{window}"] = grouped_allowed["dc_sum"].transform(
-            lambda values, w=window: values.shift(1).rolling(w, min_periods=1).mean()
+        .sort_values(
+            ["season", "conceding_team", "kickoff"],
+            kind="mergesort",
         )
-    allowed["ar_opp_tackles_allowed_5"] = grouped_allowed["tackle_sum"].transform(
-        lambda values: values.shift(1).rolling(5, min_periods=1).mean()
     )
-    opponent_columns = [
-        "season",
-        "fixture",
-        "conceding_team",
-        "ar_opp_dc_allowed_3",
-        "ar_opp_dc_allowed_5",
-        "ar_opp_dc_allowed_10",
-        "ar_opp_tackles_allowed_5",
-    ]
-    out = _checked_merge(
-        out,
-        allowed[opponent_columns],
-        "opponent defensive contributions",
-        left_on=["season", "fixture", "opponent_team_name"],
-        right_on=["season", "fixture", "conceding_team"],
-        validate="many_to_one",
-    ).drop(columns=["conceding_team", "_dc_hit", "_dc_near"], errors="ignore")
-    return out
+
+    grouped_allowed = allowed.groupby(
+        ["season", "conceding_team"],
+        sort=False,
+    )
+
+    opponent_feature_columns = []
+
+    for window in (3, 5, 10):
+        name = f"ar_opp_dc_allowed_{window}"
+
+        allowed[name] = grouped_allowed["dc_sum"].transform(
+            lambda values, w=window: (
+                values.shift(1)
+                .rolling(w, min_periods=1)
+                .mean()
+            )
+        ).astype(np.float32)
+
+        opponent_feature_columns.append(name)
+
+    allowed["ar_opp_tackles_allowed_5"] = (
+        grouped_allowed["tackle_sum"]
+        .transform(
+            lambda values: (
+                values.shift(1)
+                .rolling(5, min_periods=1)
+                .mean()
+            )
+        )
+        .astype(np.float32)
+    )
+
+    opponent_feature_columns.append(
+        "ar_opp_tackles_allowed_5"
+    )
+
+    allowed_lookup = allowed.set_index(
+        ["season", "fixture", "conceding_team"]
+    )
+
+    opponent_keys = pd.MultiIndex.from_frame(
+        tmp[["season", "fixture", "opponent_team_name"]].rename(
+            columns={
+                "opponent_team_name": "conceding_team"
+            }
+        )
+    )
+
+    for column in opponent_feature_columns:
+        tmp[column] = (
+            allowed_lookup[column]
+            .reindex(opponent_keys)
+            .to_numpy(dtype=np.float32)
+        )
+        result_columns.append(column)
+
+    del grouped
+    del grouped_allowed
+    del allowed
+    del allowed_lookup
+    del opponent_keys
+    gc.collect()
+
+    # Restore original frame row order, then attach only new columns.
+    tmp = tmp.sort_values("_row_id", kind="mergesort")
+
+    for column in result_columns:
+        frame[column] = tmp[column].to_numpy(
+            dtype=np.float32,
+            copy=False,
+        )
+
+    del tmp
+    gc.collect()
+
+    return frame
 
 
 def _prepare_team_matches(team_matches: pd.DataFrame) -> pd.DataFrame:
