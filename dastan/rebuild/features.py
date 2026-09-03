@@ -12,7 +12,7 @@ import json
 
 import numpy as np
 import pandas as pd
-
+import gc
 from .. import data
 
 WINDOWS = [1, 3, 5, 10, 38]
@@ -253,31 +253,67 @@ def compute_team_rolling(
 
 
 def add_availability_features(frame: pd.DataFrame) -> pd.DataFrame:
-    out = frame.sort_values(
-        ["fpl_code", "season", "kickoff_time"], kind="mergesort"
-    ).copy()
-    out["_played"] = out["minutes"].gt(0).astype(float)
-    out["_played60"] = out["minutes"].ge(60).astype(float)
-    grouped = out.groupby(["fpl_code", "season"], sort=False)
-    for window in [3, 5, 10]:
+    """
+    Compute availability rolling features using a narrow temporary frame.
+
+    Avoid sorting/copying the full feature frame, which can create very large
+    temporary memory spikes once the frame contains hundreds of columns.
+    """
+    needed = ["fpl_code", "season", "kickoff_time", "minutes", "position"]
+
+    tmp = frame[needed].copy()
+    tmp["_row_id"] = np.arange(len(tmp), dtype=np.int32)
+
+    tmp = tmp.sort_values(
+        ["fpl_code", "season", "kickoff_time"],
+        kind="mergesort",
+    )
+
+    tmp["_played"] = tmp["minutes"].gt(0).astype(np.float32)
+    tmp["_played60"] = tmp["minutes"].ge(60).astype(np.float32)
+
+    grouped = tmp.groupby(["fpl_code", "season"], sort=False)
+
+    result_columns = []
+
+    for window in (3, 5, 10):
         for source, prefix in (
             ("_played", "p_any"),
             ("_played60", "p60"),
             ("minutes", "e_minutes"),
         ):
-            out[f"{prefix}_{window}"] = grouped[source].transform(
-                lambda values, w=window: values.shift(1)
-                .rolling(w, min_periods=1)
-                .mean()
-            )
+            name = f"{prefix}_{window}"
+
+            tmp[name] = grouped[source].transform(
+                lambda values, w=window: (
+                    values.shift(1)
+                    .rolling(w, min_periods=1)
+                    .mean()
+                )
+            ).astype(np.float32)
+
+            result_columns.append(name)
+
     for position, defaults in POSITION_BASE_RATES.items():
-        mask = out["position"].eq(position)
-        for window in [3, 5, 10]:
+        mask = tmp["position"].eq(position)
+
+        for window in (3, 5, 10):
             for prefix in ("p_any", "p60", "e_minutes"):
-                out.loc[mask, f"{prefix}_{window}"] = out.loc[
-                    mask, f"{prefix}_{window}"
-                ].fillna(defaults[prefix])
-    return out.drop(columns=["_played", "_played60"])
+                name = f"{prefix}_{window}"
+                tmp.loc[mask, name] = tmp.loc[mask, name].fillna(
+                    defaults[prefix]
+                )
+
+    tmp = tmp.sort_values("_row_id", kind="mergesort")
+
+    for column in result_columns:
+        frame[column] = tmp[column].to_numpy(dtype=np.float32, copy=False)
+
+    del grouped
+    del tmp
+    gc.collect()
+
+    return frame
 
 
 def add_dastan_features(frame: pd.DataFrame) -> pd.DataFrame:
@@ -540,7 +576,12 @@ def build_feature_frame(
         right_on=["understat_team", "season", "_merge_date"],
         validate="many_to_one",
     ).drop(columns=["understat_team", "_merge_date"], errors="ignore")
-
+    del teams
+    del ranks
+    del team_features
+    del opponent_features
+    gc.collect()
+    
     print(
     f"  computing Dastan feature families: "
     f"{len(frame):,} rows x {len(frame.columns):,} cols, "
