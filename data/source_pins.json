@@ -2,7 +2,7 @@
   "schema_version": 1,
   "vaastav": {
     "repository": "vaastav/Fantasy-Premier-League",
-    "commit": "8c97b2adb123863c3dd581e730f1360e89815ac2"
+    "commit": "master"
   },
   "fplcache": {
     "repository": "Randdalf/fplcache",
