@@ -808,7 +808,10 @@ def build_feature_frame(
     )
 
     data.assert_deadline_anchored(frame)
+    if data.FRAME.exists():
     release_columns = list(pd.read_parquet(data.FRAME).columns)
+else:
+    release_columns = list(frame.columns)
     core_features = json.loads(
         (data.ROOT / "models" / "core_feature_cols.json").read_text()
     )
