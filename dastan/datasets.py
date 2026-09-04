@@ -29,7 +29,7 @@ from . import data, mappings, seasons
 ROOT = data.ROOT
 RELEASE_MANIFEST = data.DATA / "release_manifest.json"
 DEFAULT_RAW = ROOT / ".cache" / "dastan-raw"
-DEFAULT_OUTPUT = ROOT / ".cache" / "rebuilt-data"
+DEFAULT_OUTPUT = ROOT / "data"
 
 RELEASE_ARTIFACTS = [
     "season_registry.json",
