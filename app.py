@@ -193,6 +193,7 @@ def run_pipeline():
         frame = data.load(
             data_dir=output_dir,
             check_rows=False,
+       )
         
         with pipeline_lock:
             pipeline_state["stage"] = "running_predictions"
