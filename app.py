@@ -173,6 +173,14 @@ def run_pipeline():
             player_matches,
             team_matches,
         )
+        player_match_rows = len(player_matches)
+        team_match_rows = len(team_matches)
+
+        import gc
+        del player_matches
+        del team_matches
+        del player_lookup
+        gc.collect()
         with pipeline_lock:
             pipeline_state["stage"] = "building_predeadline_artifacts"
 
@@ -205,8 +213,8 @@ def run_pipeline():
 
         result = {
             "seasons": seasons,
-            "player_match_rows": len(player_matches),
-            "team_match_rows": len(team_matches),
+            "player_match_rows": player_match_rows,
+            "team_match_rows": team_match_rows,
             "feature_rows": len(frame),
             "feature_columns": len(frame.columns),
             "prediction_rows": len(out),
