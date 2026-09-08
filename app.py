@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from dastan import predictor, data
 from dastan.rebuild import fplcache
 from flask import Flask, jsonify
+from live import run_live_predictions
 import requests
 import pandas as pd
 
@@ -318,6 +319,76 @@ def predictions():
             "error": str(exc),
         }), 500
 
+live_lock = Lock()
+live_state = {
+    "status": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "result": None,
+    "error": None,
+}
+
+
+def run_live_pipeline():
+    with live_lock:
+        live_state.update({
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "result": None,
+            "error": None,
+        })
+
+    try:
+        result = run_live_predictions()
+
+        with live_lock:
+            live_state.update({
+                "status": "completed",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "result": result,
+                "error": None,
+            })
+
+    except Exception as exc:
+        with live_lock:
+            live_state.update({
+                "status": "failed",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "result": None,
+                "error": str(exc),
+            })
+
+
+@app.route("/live-test")
+def live_test():
+    with live_lock:
+        if live_state["status"] == "running":
+            return jsonify({
+                "status": "running",
+                "status_url": "/live-status",
+            }), 202
+
+        live_state.update({
+            "status": "starting",
+            "result": None,
+            "error": None,
+        })
+
+    worker = Thread(target=run_live_pipeline, daemon=True)
+    worker.start()
+
+    return jsonify({
+        "status": "started",
+        "message": "Live Dastan pipeline started in the background.",
+        "status_url": "/live-status",
+    }), 202
+
+
+@app.route("/live-status")
+def live_status():
+    with live_lock:
+        return jsonify(dict(live_state))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
