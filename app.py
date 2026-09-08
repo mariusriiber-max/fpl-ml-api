@@ -183,12 +183,14 @@ def run_pipeline():
             output_dir / "features.parquet",
             index=False,
         )
-
-        fplcache.build_predeadline_artifacts(
-            raw_dir,
-            output_dir,
-            seasons,
-        )
+        del frame
+        import gc
+        gc.collect()
+    fplcache.build_predeadline_artifacts(
+        raw_dir,
+        output_dir,
+        seasons,
+    )
 
         frame = data.load(
             data_dir=output_dir,
