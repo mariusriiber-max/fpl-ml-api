@@ -2,7 +2,8 @@ from pathlib import Path
 from threading import Thread, Lock
 from datetime import datetime, timezone
 
-from dastan import predictor
+from dastan import predictor, data
+from dastan.rebuild import fplcache
 from flask import Flask, jsonify
 import requests
 
@@ -172,7 +173,27 @@ def run_pipeline():
             player_matches,
             team_matches,
         )
+        with pipeline_lock:
+            pipeline_state["stage"] = "building_predeadline_artifacts"
 
+        output_dir = root / "data"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        frame.to_parquet(
+            output_dir / "features.parquet",
+            index=False,
+        )
+
+        fplcache.build_predeadline_artifacts(
+            raw_dir,
+            output_dir,
+            seasons,
+        )
+
+        frame = data.load(
+            data_dir=output_dir,
+            check_rows=False,
+        
         with pipeline_lock:
             pipeline_state["stage"] = "running_predictions"
 
