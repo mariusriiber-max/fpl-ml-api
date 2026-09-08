@@ -312,12 +312,11 @@ def predictions():
             "predictions": rows,
         })
 
-        except Exception as exc:
+            except Exception as exc:
         return jsonify({
             "status": "error",
             "error": str(exc),
         }), 500
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
