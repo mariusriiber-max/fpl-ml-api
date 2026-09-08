@@ -6,7 +6,7 @@ from dastan import predictor, data
 from dastan.rebuild import fplcache
 from flask import Flask, jsonify
 import requests
-
+import pandas as pd
 
 app = Flask(__name__)
 
@@ -210,6 +210,7 @@ def run_pipeline():
 
         model = predictor.Dastan()
         out = model.predict_frame(frame, with_parts=True)
+        out.to_parquet(output_dir / "predictions.parquet", index=False)
 
         result = {
             "seasons": seasons,
@@ -278,15 +279,44 @@ def pipeline_status():
 
 @app.route("/predictions")
 def predictions():
-    return jsonify({
-        "status": "ok",
-        "model": "ml-not-connected",
-        "predictions": [],
-        "message": (
-            "FPL player data service is live. "
-            "External ML inference will be connected next."
-        ),
-    })
+    try:
+        output_dir = Path(__file__).resolve().parent / "data"
+        predictions_path = output_dir / "predictions.parquet"
+
+        if not predictions_path.exists():
+            return jsonify({
+                "status": "error",
+                "error": "Predictions are not ready yet. Run /pipeline-test first.",
+            }), 503
+
+        out = pd.read_parquet(predictions_path)
+
+        latest_gw = int(out["gameweek"].max())
+        latest = out[out["gameweek"] == latest_gw].copy()
+        latest = latest.sort_values("xpts", ascending=False)
+
+        rows = []
+        for _, row in latest.head(50).iterrows():
+            rows.append({
+                "player": row.get("player_name"),
+                "team": row.get("team_name"),
+                "position": row.get("position"),
+                "gameweek": int(row["gameweek"]),
+                "xpts": round(float(row["xpts"]), 2),
+            })
+
+        return jsonify({
+            "status": "ok",
+            "gameweek": latest_gw,
+            "count": len(rows),
+            "predictions": rows,
+        })
+
+        except Exception as exc:
+        return jsonify({
+            "status": "error",
+            "error": str(exc),
+        }), 500
 
 
 if __name__ == "__main__":
