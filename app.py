@@ -186,11 +186,11 @@ def run_pipeline():
         del frame
         import gc
         gc.collect()
-    fplcache.build_predeadline_artifacts(
-        raw_dir,
-        output_dir,
-        seasons,
-    )
+        fplcache.build_predeadline_artifacts(
+            raw_dir,
+            output_dir,
+            seasons,
+        )
 
         frame = data.load(
             data_dir=output_dir,
