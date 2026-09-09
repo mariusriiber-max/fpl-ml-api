@@ -346,6 +346,115 @@ def _write_live_snapshot_artifacts(
     )
 
 
+def _live_feature_audit(
+    scored_frame: pd.DataFrame,
+    predictions: pd.DataFrame,
+    current_roster: pd.DataFrame,
+) -> list[dict]:
+    """Expose the actual model inputs for a few high-value current players."""
+    roster = current_roster[
+        ["element", "player_name_current", "current_team_name"]
+    ].copy()
+
+    names = {"Rogers", "Palmer", "Gabriel", "João Pedro", "Joao Pedro"}
+    roster = roster[
+        roster["player_name_current"].fillna("").astype(str).isin(names)
+    ].copy()
+
+    if roster.empty:
+        return []
+
+    # Candidate columns: exact released features plus the most useful live inputs.
+    wanted_patterns = (
+        "ep_next",
+        "chance",
+        "status",
+        "news",
+        "minutes",
+        "form",
+        "points",
+        "xg",
+        "xa",
+        "xgi",
+        "expected",
+        "team_",
+        "opp",
+        "fixture",
+        "gameweek",
+    )
+
+    identity_cols = [
+        c for c in ["element", "fpl_code", "fixture", "gameweek"]
+        if c in scored_frame.columns
+    ]
+    candidate_cols = [
+        c for c in scored_frame.columns
+        if c not in identity_cols
+        and any(p in c.lower() for p in wanted_patterns)
+    ]
+
+    # Keep audit readable while prioritising known Dastan live-signal columns.
+    priority = [
+        "ar_ep_next",
+        "sig_status_risk",
+        "sig_chance_playing",
+        "sig_has_news",
+    ]
+    ordered = []
+    for c in priority + candidate_cols:
+        if c in scored_frame.columns and c not in ordered:
+            ordered.append(c)
+    ordered = ordered[:45]
+
+    audit_frame = scored_frame[identity_cols + ordered].copy()
+    audit_frame = audit_frame.merge(
+        roster,
+        on="element",
+        how="inner",
+        validate="many_to_one",
+    )
+
+    # Attach output-side p60 / expected minutes / xPts for the exact fixture row.
+    pred_cols = [
+        c for c in [
+            "element", "fixture", "xpts", "p60", "expected_minutes"
+        ] if c in predictions.columns
+    ]
+    if {"element", "fixture"}.issubset(pred_cols):
+        audit_frame = audit_frame.merge(
+            predictions[pred_cols],
+            on=["element", "fixture"],
+            how="left",
+            validate="one_to_one",
+        )
+
+    def clean(value):
+        if pd.isna(value):
+            return None
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating,)):
+            return round(float(value), 5)
+        if isinstance(value, float):
+            return round(value, 5)
+        return value
+
+    rows = []
+    for _, row in audit_frame.iterrows():
+        item = {
+            "player": row["player_name_current"],
+            "team": row["current_team_name"],
+        }
+        for col in identity_cols + ordered + [
+            "xpts", "p60", "expected_minutes"
+        ]:
+            if col in row.index:
+                item[col] = clean(row[col])
+        rows.append(item)
+
+    return rows
+
+
 def _validate_live_fixtures(
     frame: pd.DataFrame,
     bootstrap: dict,
@@ -677,6 +786,12 @@ def run_live_predictions(root: Path | None = None) -> dict:
         index=False,
     )
 
+    feature_audit = _live_feature_audit(
+        scored_frame,
+        predictions,
+        current_roster,
+    )
+
     return {
         "status": "ok",
         "season": ACTIVE_SEASON,
@@ -687,6 +802,7 @@ def run_live_predictions(root: Path | None = None) -> dict:
         "fixture_rows": int(len(predictions)),
         "scored_current_roster_rows": int(len(scored_frame)),
         "fixture_validation": fixture_validation,
+        "feature_audit": feature_audit,
         "model_features": int(len(model.features)),
         "official_fpl_roster_players": int(len(current_roster)),
         "official_fpl_teams": sorted(current_roster["current_team_name"].dropna().unique().tolist()),
