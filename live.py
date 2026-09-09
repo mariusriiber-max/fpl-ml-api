@@ -101,6 +101,11 @@ def _current_roster(bootstrap: dict) -> pd.DataFrame:
             "second_name_current": player.get("second_name"),
             "web_name_current": player.get("web_name"),
             "team_id_current": int(player["team"]),
+            "team_short_current": next(
+                team["short_name"]
+                for team in bootstrap["teams"]
+                if int(team["id"]) == int(player["team"])
+            ),
             "position_current": _position_name(player["element_type"]),
             "price_current": float(player["now_cost"]) / 10.0,
         }
@@ -341,6 +346,50 @@ def _write_live_snapshot_artifacts(
     )
 
 
+def _validate_live_fixtures(
+    frame: pd.DataFrame,
+    bootstrap: dict,
+    fixtures: list,
+    gameweek: int,
+) -> dict:
+    """Hard-check that live target rows point at the official current GW fixtures."""
+    team_names = {int(t["id"]): t["name"] for t in bootstrap["teams"]}
+    official = {
+        int(f["id"]): (int(f["team_h"]), int(f["team_a"]))
+        for f in fixtures
+        if f.get("event") == gameweek
+    }
+    if len(official) != 10:
+        raise RuntimeError(
+            f"Official FPL API returned {len(official)} fixtures for GW{gameweek}, expected 10."
+        )
+
+    if "fixture" not in frame.columns:
+        raise RuntimeError("Live scoring frame has no fixture column.")
+
+    frame_fixture_ids = set(
+        pd.to_numeric(frame["fixture"], errors="coerce").dropna().astype(int)
+    )
+    unknown = sorted(frame_fixture_ids - set(official))
+    if unknown:
+        raise RuntimeError(
+            f"Live scoring frame contains non-GW{gameweek} fixture IDs: {unknown[:10]}"
+        )
+
+    fixture_summary = []
+    for fixture_id, (home_id, away_id) in official.items():
+        fixture_summary.append({
+            "fixture": fixture_id,
+            "home": team_names[home_id],
+            "away": team_names[away_id],
+        })
+
+    return {
+        "count": len(official),
+        "fixtures": fixture_summary,
+    }
+
+
 def _restrict_scoring_frame_to_current_roster(
     frame: pd.DataFrame,
     current_roster: pd.DataFrame,
@@ -520,6 +569,12 @@ def run_live_predictions(root: Path | None = None) -> dict:
         scored_frame,
         current_roster,
     )
+    fixture_validation = _validate_live_fixtures(
+        scored_frame,
+        bootstrap,
+        fixtures,
+        gameweek,
+    )
 
     model = predictor.Dastan()
     predictions = model.predict_frame(
@@ -611,6 +666,7 @@ def run_live_predictions(root: Path | None = None) -> dict:
             expected_minutes=("expected_minutes", "sum"),
             p60=("p60", "max"),
             fixtures=("fixture", "nunique"),
+            fixture_ids=("fixture", lambda s: sorted(set(int(x) for x in s.dropna()))),
         )
         .sort_values("xpts", ascending=False)
         .reset_index(drop=True)
@@ -630,6 +686,7 @@ def run_live_predictions(root: Path | None = None) -> dict:
         "players": int(len(top)),
         "fixture_rows": int(len(predictions)),
         "scored_current_roster_rows": int(len(scored_frame)),
+        "fixture_validation": fixture_validation,
         "model_features": int(len(model.features)),
         "official_fpl_roster_players": int(len(current_roster)),
         "official_fpl_teams": sorted(current_roster["current_team_name"].dropna().unique().tolist()),
@@ -643,6 +700,7 @@ def run_live_predictions(root: Path | None = None) -> dict:
                 "xpts": round(float(row.xpts), 2),
                 "expected_minutes": round(float(row.expected_minutes), 1),
                 "p60": round(float(row.p60), 3),
+                "fixture_ids": row.fixture_ids,
             }
             for row in top.head(10).itertuples()
         ],
