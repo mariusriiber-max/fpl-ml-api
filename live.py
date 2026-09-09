@@ -346,6 +346,97 @@ def _write_live_snapshot_artifacts(
     )
 
 
+def _carry_understat_identity_and_history_into_live_rows(
+    frame: pd.DataFrame,
+    active_season: str,
+    gameweek: int,
+) -> pd.DataFrame:
+    """Repair synthetic live rows before feature engineering.
+
+    For each stable player identity, copy the latest *raw Understat source fields*
+    from a completed historical match into the synthetic current-GW row.
+    This does NOT copy targets, FPL points, current-fixture outcomes or already
+    rolled model features. The normal Dastan rolling code still performs its
+    own shift/rolling/deadline anchoring afterwards.
+    """
+    out = frame.copy()
+
+    if "fpl_code" not in out.columns:
+        raise RuntimeError("Cannot carry Understat history: fpl_code missing.")
+
+    target_mask = (
+        out["season"].eq(active_season)
+        & pd.to_numeric(out["gameweek"], errors="coerce").eq(gameweek)
+    )
+
+    # Only provider-level Understat columns. Never copy model/target/output fields.
+    blocked_fragments = (
+        "target",
+        "points",
+        "minutes",
+        "fixture",
+        "gameweek",
+        "kickoff",
+        "expected_minutes",
+        "p60",
+        "ep_next",
+        "sig_",
+        "player_fpl_",
+    )
+    us_cols = [
+        c for c in out.columns
+        if c.startswith("us_")
+        and not any(fragment in c.lower() for fragment in blocked_fragments)
+    ]
+
+    if not us_cols:
+        return out
+
+    history = out.loc[~target_mask].copy()
+    if history.empty:
+        return out
+
+    # Prefer chronological latest completed observation.
+    sort_cols = [
+        c for c in ["kickoff_time", "season", "gameweek", "fixture"]
+        if c in history.columns
+    ]
+    if sort_cols:
+        history = history.sort_values(sort_cols)
+
+    # Stable FPL code is the repository's cross-season player identity.
+    latest = (
+        history.groupby("fpl_code", dropna=False)[us_cols]
+        .last()
+        .reset_index()
+    )
+
+    target = out.loc[target_mask, ["fpl_code"]].merge(
+        latest,
+        on="fpl_code",
+        how="left",
+        validate="many_to_one",
+    )
+    target.index = out.index[target_mask]
+
+    # Fill only missing synthetic values. For raw US metrics, zeros generated
+    # solely because the future row has no match observation are also repaired
+    # when a non-null historical provider value exists.
+    for col in us_cols:
+        hist_values = target[col]
+        current = out.loc[target_mask, col]
+        replace = current.isna()
+        if pd.api.types.is_numeric_dtype(out[col]):
+            replace = replace | (
+                pd.to_numeric(current, errors="coerce").eq(0)
+                & pd.to_numeric(hist_values, errors="coerce").notna()
+            )
+        idx = current.index[replace]
+        out.loc[idx, col] = hist_values.loc[idx]
+
+    return out
+
+
 def _live_feature_audit(
     scored_frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -641,6 +732,12 @@ def run_live_predictions(root: Path | None = None) -> dict:
 
     del future_teams
     gc.collect()
+
+    player_matches = _carry_understat_identity_and_history_into_live_rows(
+        player_matches,
+        ACTIVE_SEASON,
+        gameweek,
+    )
 
     frame = features.build_feature_frame(
         player_matches,
