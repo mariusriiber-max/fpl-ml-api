@@ -97,6 +97,9 @@ def _current_roster(bootstrap: dict) -> pd.DataFrame:
             "element": int(player["id"]),
             "fpl_code_current": int(player["code"]),
             "player_name_current": player.get("web_name") or player.get("second_name"),
+            "first_name_current": player.get("first_name"),
+            "second_name_current": player.get("second_name"),
+            "web_name_current": player.get("web_name"),
             "team_id_current": int(player["team"]),
             "position_current": _position_name(player["element_type"]),
             "price_current": float(player["now_cost"]) / 10.0,
@@ -338,6 +341,33 @@ def _write_live_snapshot_artifacts(
     )
 
 
+def _roster_diagnostics(current_roster: pd.DataFrame) -> list[dict]:
+    """Return exact current FPL rows for suspicious names before Dastan metadata is used."""
+    search = current_roster[
+        current_roster[
+            ["first_name_current", "second_name_current", "web_name_current"]
+        ]
+        .fillna("")
+        .astype(str)
+        .agg(" ".join, axis=1)
+        .str.lower()
+        .str.contains(r"rogers|salah", regex=True)
+    ].copy()
+
+    cols = [
+        "element",
+        "fpl_code_current",
+        "first_name_current",
+        "second_name_current",
+        "web_name_current",
+        "team_id_current",
+        "current_team_name",
+        "position_current",
+        "price_current",
+    ]
+    return search[cols].to_dict("records")
+
+
 def run_live_predictions(root: Path | None = None) -> dict:
     root = Path(root) if root is not None else Path(__file__).resolve().parent
     raw_dir = root / ".cache" / "dastan-live-raw"
@@ -541,6 +571,7 @@ def run_live_predictions(root: Path | None = None) -> dict:
         "model_features": int(len(model.features)),
         "official_fpl_roster_players": int(len(current_roster)),
         "official_fpl_teams": sorted(current_roster["current_team_name"].dropna().unique().tolist()),
+        "official_fpl_diagnostics": _roster_diagnostics(current_roster),
         "top_10": [
             {
                 "player": row.player_name,
