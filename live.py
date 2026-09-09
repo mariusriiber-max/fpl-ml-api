@@ -46,10 +46,19 @@ def _live_operational_mapping_mode():
 
 
 def _get_json(url: str) -> dict | list:
+    # Force a fresh FPL response. The public endpoints can sit behind CDN/proxy
+    # caches, and stale player/team metadata is unacceptable for live scoring.
+    cache_buster = int(datetime.now(timezone.utc).timestamp())
+    separator = "&" if "?" in url else "?"
+    fresh_url = f"{url}{separator}_={cache_buster}"
     response = requests.get(
-        url,
+        fresh_url,
         timeout=30,
-        headers={"User-Agent": "fpl-ml-api/1.0"},
+        headers={
+            "User-Agent": "fpl-ml-api/1.0",
+            "Cache-Control": "no-cache, no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
     )
     response.raise_for_status()
     return response.json()
@@ -71,6 +80,43 @@ def _position_name(element_type: int) -> str:
         3: "MID",
         4: "FWD",
     }[int(element_type)]
+
+
+def _current_roster(bootstrap: dict) -> pd.DataFrame:
+    teams = {
+        int(team["id"]): team["name"]
+        for team in bootstrap["teams"]
+    }
+    if len(teams) != 20:
+        raise RuntimeError(
+            f"Official FPL bootstrap returned {len(teams)} teams, expected 20."
+        )
+
+    roster = pd.DataFrame([
+        {
+            "element": int(player["id"]),
+            "fpl_code_current": int(player["code"]),
+            "player_name_current": player.get("web_name") or player.get("second_name"),
+            "team_id_current": int(player["team"]),
+            "position_current": _position_name(player["element_type"]),
+            "price_current": float(player["now_cost"]) / 10.0,
+        }
+        for player in bootstrap["elements"]
+    ])
+
+    if roster["element"].duplicated().any():
+        raise RuntimeError("Official FPL bootstrap contains duplicate element IDs.")
+
+    unknown_team_ids = sorted(
+        set(roster["team_id_current"].dropna().astype(int)) - set(teams)
+    )
+    if unknown_team_ids:
+        raise RuntimeError(
+            f"Official FPL bootstrap players reference unknown teams: {unknown_team_ids}"
+        )
+
+    roster["current_team_name"] = roster["team_id_current"].map(teams)
+    return roster
 
 
 def _future_player_rows(
@@ -300,6 +346,7 @@ def run_live_predictions(root: Path | None = None) -> dict:
 
     bootstrap = _get_json(FPL_BOOTSTRAP_URL)
     fixtures = _get_json(FPL_FIXTURES_URL)
+    current_roster = _current_roster(bootstrap)
     next_event = _next_gameweek(bootstrap)
     gameweek = int(next_event["id"])
     deadline = pd.to_datetime(next_event["deadline_time"], utc=True)
@@ -395,30 +442,67 @@ def run_live_predictions(root: Path | None = None) -> dict:
         with_parts=True,
     )
 
-    names = pd.DataFrame([
-        {
-            "fpl_code": int(player["code"]),
-            "player_name": player.get("web_name") or player.get("second_name"),
-            "team_id": int(player["team"]),
-            "price": float(player["now_cost"]) / 10.0,
-        }
-        for player in bootstrap["elements"]
-    ])
-    team_names = {
-        int(team["id"]): team["name"]
-        for team in bootstrap["teams"]
-    }
-    names["current_team_name"] = names["team_id"].map(team_names)
+    # Current-season FPL element ID is the publication key.
+    # Historical fpl_code is still used inside feature engineering, but it is
+    # never allowed to decide today's player name, club, position or price.
+    if "element" not in predictions.columns:
+        raise RuntimeError(
+            "Dastan prediction frame has no current-season FPL element ID."
+        )
 
-    predictions = predictions.drop(
-        columns=["player_name"],
-        errors="ignore",
-    ).merge(
-        names,
-        on="fpl_code",
+    predictions["element"] = pd.to_numeric(
+        predictions["element"],
+        errors="coerce",
+    ).astype("Int64")
+
+    predictions = predictions.merge(
+        current_roster,
+        on="element",
         how="left",
         validate="many_to_one",
+        indicator=True,
     )
+
+    missing_current = predictions["_merge"].ne("both")
+    if missing_current.any():
+        examples = (
+            predictions.loc[missing_current, ["element", "fpl_code"]]
+            .head(10)
+            .to_dict("records")
+        )
+        raise RuntimeError(
+            "Refusing to publish predictions for players absent from the current "
+            f"official FPL roster. Examples: {examples}"
+        )
+    predictions = predictions.drop(columns=["_merge"])
+
+    # A current element must also carry the same stable FPL code that entered
+    # the target row. A mismatch means historical identity leaked into the row.
+    pred_codes = pd.to_numeric(predictions["fpl_code"], errors="coerce").astype("Int64")
+    current_codes = pd.to_numeric(
+        predictions["fpl_code_current"],
+        errors="coerce",
+    ).astype("Int64")
+    identity_mismatch = pred_codes.ne(current_codes)
+    if identity_mismatch.any():
+        examples = (
+            predictions.loc[
+                identity_mismatch,
+                ["element", "fpl_code", "fpl_code_current", "player_name_current"],
+            ]
+            .head(10)
+            .to_dict("records")
+        )
+        raise RuntimeError(
+            "Current FPL identity validation failed; historical/current player "
+            f"mapping is inconsistent. Examples: {examples}"
+        )
+
+    # Overwrite all public metadata from the fresh official FPL roster.
+    predictions["player_name"] = predictions["player_name_current"]
+    predictions["current_team_name"] = predictions["current_team_name"]
+    predictions["position"] = predictions["position_current"]
+    predictions["price"] = predictions["price_current"]
 
     predictions.to_parquet(
         output_dir / "predictions.parquet",
@@ -455,6 +539,8 @@ def run_live_predictions(root: Path | None = None) -> dict:
         "players": int(len(top)),
         "fixture_rows": int(len(predictions)),
         "model_features": int(len(model.features)),
+        "official_fpl_roster_players": int(len(current_roster)),
+        "official_fpl_teams": sorted(current_roster["current_team_name"].dropna().unique().tolist()),
         "top_10": [
             {
                 "player": row.player_name,
