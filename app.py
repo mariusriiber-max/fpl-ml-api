@@ -389,6 +389,62 @@ def live_test():
 def live_status():
     with live_lock:
         return jsonify(dict(live_state))
+# --- Base44 production endpoint: Dastan current-GW predictions ---
+@app.get("/api/dastan/predictions")
+def dastan_predictions():
+    """Return the latest successfully generated live Dastan player-GW predictions."""
+    try:
+        live_file = Path(__file__).resolve().parent / "data" / "live" / "predictions_player_gw.parquet"
+        if not live_file.exists():
+            return jsonify({
+                "status": "not_ready",
+                "error": "No live Dastan prediction file exists yet."
+            }), 503
+
+        df = pd.read_parquet(live_file)
+
+        required = {
+            "fpl_code", "player", "team", "position", "price",
+            "xpts", "expected_minutes", "p60", "fixtures"
+        }
+        missing = sorted(required - set(df.columns))
+        if missing:
+            return jsonify({
+                "status": "error",
+                "error": f"Prediction file is missing columns: {missing}"
+            }), 500
+
+        df = df.sort_values("xpts", ascending=False).copy()
+
+        players = []
+        for rank, row in enumerate(df.itertuples(index=False), start=1):
+            players.append({
+                "rank": rank,
+                "fpl_code": int(row.fpl_code),
+                "player": str(row.player),
+                "team": str(row.team),
+                "position": str(row.position),
+                "price": round(float(row.price), 1),
+                "xpts": round(float(row.xpts), 3),
+                "expected_minutes": round(float(row.expected_minutes), 1),
+                "p60": round(float(row.p60), 4),
+                "fixtures": int(row.fixtures),
+            })
+
+        return jsonify({
+            "status": "ok",
+            "model": "Dastan",
+            "season": "2026-27",
+            "gameweek": 4,
+            "count": len(players),
+            "players": players,
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "status": "error",
+            "error": str(exc),
+        }), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
