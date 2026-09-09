@@ -341,6 +341,56 @@ def _write_live_snapshot_artifacts(
     )
 
 
+def _restrict_scoring_frame_to_current_roster(
+    frame: pd.DataFrame,
+    current_roster: pd.DataFrame,
+) -> pd.DataFrame:
+    """Allow only exact current FPL element+code identities into live scoring."""
+    required = {"element", "fpl_code"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise RuntimeError(
+            f"Live scoring frame lacks identity columns: {sorted(missing)}"
+        )
+
+    roster_keys = current_roster[
+        ["element", "fpl_code_current"]
+    ].copy()
+
+    checked = frame.copy()
+    checked["element"] = pd.to_numeric(
+        checked["element"], errors="coerce"
+    ).astype("Int64")
+    checked["fpl_code"] = pd.to_numeric(
+        checked["fpl_code"], errors="coerce"
+    ).astype("Int64")
+
+    roster_keys["element"] = pd.to_numeric(
+        roster_keys["element"], errors="coerce"
+    ).astype("Int64")
+    roster_keys["fpl_code_current"] = pd.to_numeric(
+        roster_keys["fpl_code_current"], errors="coerce"
+    ).astype("Int64")
+
+    checked = checked.merge(
+        roster_keys,
+        on="element",
+        how="inner",
+        validate="many_to_one",
+    )
+
+    checked = checked.loc[
+        checked["fpl_code"].eq(checked["fpl_code_current"])
+    ].drop(columns=["fpl_code_current"]).copy()
+
+    if checked.empty:
+        raise RuntimeError(
+            "No rows survived exact current FPL roster validation before scoring."
+        )
+
+    return checked
+
+
 def _roster_diagnostics(current_roster: pd.DataFrame) -> list[dict]:
     """Return exact current FPL rows for suspicious names before Dastan metadata is used."""
     search = current_roster[
@@ -466,73 +516,84 @@ def run_live_predictions(root: Path | None = None) -> dict:
         check_rows=False,
     )
 
+    scored_frame = _restrict_scoring_frame_to_current_roster(
+        scored_frame,
+        current_roster,
+    )
+
     model = predictor.Dastan()
     predictions = model.predict_frame(
         scored_frame,
         with_parts=True,
     )
 
-    # Current-season FPL element ID is the publication key.
-    # Historical fpl_code is still used inside feature engineering, but it is
-    # never allowed to decide today's player name, club, position or price.
-    if "element" not in predictions.columns:
-        raise RuntimeError(
-            "Dastan prediction frame has no current-season FPL element ID."
-        )
-
+    # Publish ONLY metadata from the fresh official FPL roster.
     predictions["element"] = pd.to_numeric(
-        predictions["element"],
-        errors="coerce",
+        predictions["element"], errors="coerce"
     ).astype("Int64")
+
+    # Remove every display field that may have leaked from historical rebuild data.
+    for col in [
+        "player",
+        "player_name",
+        "web_name",
+        "team",
+        "team_name",
+        "current_team_name",
+        "position",
+        "price",
+    ]:
+        if col in predictions.columns:
+            predictions = predictions.drop(columns=[col])
+
+    publish_roster = current_roster[
+        [
+            "element",
+            "fpl_code_current",
+            "player_name_current",
+            "current_team_name",
+            "position_current",
+            "price_current",
+        ]
+    ].copy()
 
     predictions = predictions.merge(
-        current_roster,
+        publish_roster,
         on="element",
-        how="left",
+        how="inner",
         validate="many_to_one",
-        indicator=True,
     )
 
-    missing_current = predictions["_merge"].ne("both")
-    if missing_current.any():
-        examples = (
-            predictions.loc[missing_current, ["element", "fpl_code"]]
-            .head(10)
-            .to_dict("records")
-        )
-        raise RuntimeError(
-            "Refusing to publish predictions for players absent from the current "
-            f"official FPL roster. Examples: {examples}"
-        )
-    predictions = predictions.drop(columns=["_merge"])
-
-    # A current element must also carry the same stable FPL code that entered
-    # the target row. A mismatch means historical identity leaked into the row.
-    pred_codes = pd.to_numeric(predictions["fpl_code"], errors="coerce").astype("Int64")
-    current_codes = pd.to_numeric(
-        predictions["fpl_code_current"],
-        errors="coerce",
+    pred_codes = pd.to_numeric(
+        predictions["fpl_code"], errors="coerce"
     ).astype("Int64")
-    identity_mismatch = pred_codes.ne(current_codes)
-    if identity_mismatch.any():
+    roster_codes = pd.to_numeric(
+        predictions["fpl_code_current"], errors="coerce"
+    ).astype("Int64")
+
+    mismatch = pred_codes.ne(roster_codes)
+    if mismatch.any():
         examples = (
             predictions.loc[
-                identity_mismatch,
+                mismatch,
                 ["element", "fpl_code", "fpl_code_current", "player_name_current"],
             ]
             .head(10)
             .to_dict("records")
         )
         raise RuntimeError(
-            "Current FPL identity validation failed; historical/current player "
-            f"mapping is inconsistent. Examples: {examples}"
+            "Current-roster identity mismatch after scoring. "
+            f"Examples: {examples}"
         )
 
-    # Overwrite all public metadata from the fresh official FPL roster.
-    predictions["player_name"] = predictions["player_name_current"]
-    predictions["current_team_name"] = predictions["current_team_name"]
-    predictions["position"] = predictions["position_current"]
-    predictions["price"] = predictions["price_current"]
+    predictions = predictions.rename(
+        columns={
+            "player_name_current": "player",
+            "current_team_name": "team",
+            "position_current": "position",
+            "price_current": "price",
+        }
+    )
 
     predictions.to_parquet(
         output_dir / "predictions.parquet",
@@ -541,7 +602,7 @@ def run_live_predictions(root: Path | None = None) -> dict:
 
     top = (
         predictions.groupby(
-            ["fpl_code", "player_name", "current_team_name", "position", "price"],
+            ["fpl_code", "player", "team", "position", "price"],
             dropna=False,
             as_index=False,
         )
@@ -568,14 +629,15 @@ def run_live_predictions(root: Path | None = None) -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "players": int(len(top)),
         "fixture_rows": int(len(predictions)),
+        "scored_current_roster_rows": int(len(scored_frame)),
         "model_features": int(len(model.features)),
         "official_fpl_roster_players": int(len(current_roster)),
         "official_fpl_teams": sorted(current_roster["current_team_name"].dropna().unique().tolist()),
         "official_fpl_diagnostics": _roster_diagnostics(current_roster),
         "top_10": [
             {
-                "player": row.player_name,
-                "team": row.current_team_name,
+                "player": row.player,
+                "team": row.team,
                 "position": row.position,
                 "price": round(float(row.price), 1),
                 "xpts": round(float(row.xpts), 2),
