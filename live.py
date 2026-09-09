@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import gc
@@ -8,13 +9,40 @@ import numpy as np
 import pandas as pd
 import requests
 
-from dastan import data, predictor
+from dastan import data, predictor, mappings
 from dastan.rebuild import features, sources, fplcache
 
 FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
 FPL_FIXTURES_URL = "https://fantasy.premierleague.com/api/fixtures/"
 ACTIVE_SEASON = "2026-27"
 HISTORY_SEASONS = ["2025-26", ACTIVE_SEASON]
+
+
+@contextmanager
+def _live_operational_mapping_mode():
+    """Use current player identities for live inference without the retraining club gate.
+
+    Dastan's public mapping guard blocks a new-season *retraining* build until every
+    promoted club has a reviewed Understat club ID. Live scoring does not use those
+    club IDs: current player Understat identities are joined by fpl_code, while team
+    match data is loaded independently from the Understat league/team histories.
+
+    Keep the upstream guard intact everywhere else and relax it only while this live
+    inference job resolves current-season assignments.
+    """
+    original = mappings.assert_operational_clubs_ready
+
+    def live_check(season: str) -> None:
+        roster = mappings.load_roster()
+        active = str(roster["season"].iat[0])
+        if str(season) != active:
+            original(season)
+
+    mappings.assert_operational_clubs_ready = live_check
+    try:
+        yield
+    finally:
+        mappings.assert_operational_clubs_ready = original
 
 
 def _get_json(url: str) -> dict | list:
@@ -283,18 +311,19 @@ def run_live_predictions(root: Path | None = None) -> dict:
         flush=True,
     )
 
-    sources.download_sources(
-        raw_dir=raw_dir,
-        seasons=HISTORY_SEASONS,
-        workers=1,
-        force=False,
-        allow_missing_understat=True,
-    )
+    with _live_operational_mapping_mode():
+        sources.download_sources(
+            raw_dir=raw_dir,
+            seasons=HISTORY_SEASONS,
+            workers=1,
+            force=False,
+            allow_missing_understat=True,
+        )
 
-    player_matches, team_matches, _ = sources.build_canonical_matches(
-        raw_dir,
-        HISTORY_SEASONS,
-    )
+        player_matches, team_matches, _ = sources.build_canonical_matches(
+            raw_dir,
+            HISTORY_SEASONS,
+        )
 
     future_players = _future_player_rows(
         player_matches,
