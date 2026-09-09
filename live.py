@@ -275,6 +275,11 @@ def _write_live_snapshot_artifacts(
             ),
             "sig_chance_playing": -1.0 if chance is None else float(chance),
             "sig_has_news": float(bool((player.get("news") or "").strip())),
+            "sig_pens_order": -1.0,
+            "sig_fk_order": -1.0,
+            "sig_corners_order": -1.0,
+            "sig_age_years": -1.0,
+            "sig_days_at_club": -1.0,
         })
 
     pd.DataFrame(ep_rows).to_parquet(
