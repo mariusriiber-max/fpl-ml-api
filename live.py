@@ -437,6 +437,75 @@ def _carry_understat_identity_and_history_into_live_rows(
     return out
 
 
+def _model_team_feature_audit(
+    scored_frame: pd.DataFrame,
+    model,
+    current_roster: pd.DataFrame,
+) -> dict:
+    """Audit only columns that are truly consumed by the released Dastan model."""
+    model_cols = [c for c in model.features if c in scored_frame.columns]
+
+    # Team/opponent/OpenFPL rolling families among the actual 286 model inputs.
+    keywords = (
+        "team", "opp", "opponent", "xg", "xga", "npxg", "npxga",
+        "deep", "ppda", "scored", "missed", "pts"
+    )
+    team_model_cols = [
+        c for c in model_cols
+        if any(k in c.lower() for k in keywords)
+    ]
+
+    roster = current_roster[
+        ["element", "player_name_current", "current_team_name"]
+    ].copy()
+    wanted = {"Rogers", "Palmer", "Gabriel", "João Pedro", "Joao Pedro"}
+    roster = roster[
+        roster["player_name_current"].fillna("").astype(str).isin(wanted)
+    ]
+
+    sample = scored_frame.merge(
+        roster,
+        on="element",
+        how="inner",
+        validate="many_to_one",
+    )
+
+    # Keep the output readable: report up to 80 genuine model columns.
+    cols = team_model_cols[:80]
+
+    def clean(v):
+        if pd.isna(v):
+            return None
+        if isinstance(v, (np.integer,)):
+            return int(v)
+        if isinstance(v, (np.floating, float)):
+            return round(float(v), 6)
+        return v
+
+    rows = []
+    for _, row in sample.iterrows():
+        values = {c: clean(row[c]) for c in cols}
+        numeric = [
+            float(row[c]) for c in cols
+            if pd.notna(row[c]) and isinstance(row[c], (int, float, np.integer, np.floating))
+        ]
+        rows.append({
+            "player": row["player_name_current"],
+            "team": row["current_team_name"],
+            "fixture": clean(row.get("fixture")),
+            "model_team_feature_count": len(cols),
+            "nonzero_numeric_count": sum(abs(v) > 1e-12 for v in numeric),
+            "features": values,
+        })
+
+    return {
+        "actual_model_feature_count": len(model_cols),
+        "team_opponent_model_feature_count": len(team_model_cols),
+        "audited_columns": cols,
+        "players": rows,
+    }
+
+
 def _live_feature_audit(
     scored_frame: pd.DataFrame,
     predictions: pd.DataFrame,
@@ -883,6 +952,12 @@ def run_live_predictions(root: Path | None = None) -> dict:
         index=False,
     )
 
+    model_team_feature_audit = _model_team_feature_audit(
+        scored_frame,
+        model,
+        current_roster,
+    )
+
     feature_audit = _live_feature_audit(
         scored_frame,
         predictions,
@@ -900,6 +975,7 @@ def run_live_predictions(root: Path | None = None) -> dict:
         "scored_current_roster_rows": int(len(scored_frame)),
         "fixture_validation": fixture_validation,
         "feature_audit": feature_audit,
+        "model_team_feature_audit": model_team_feature_audit,
         "model_features": int(len(model.features)),
         "official_fpl_roster_players": int(len(current_roster)),
         "official_fpl_teams": sorted(current_roster["current_team_name"].dropna().unique().tolist()),
