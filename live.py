@@ -304,20 +304,27 @@ def _write_live_snapshot_artifacts(
     output_dir: Path,
     bootstrap: dict,
     gameweek: int,
+    official_next_gameweek: int,
 ) -> None:
     ep_rows = []
     signal_rows = []
 
     for player in bootstrap["elements"]:
         fpl_code = int(player["code"])
-        raw_ep = player.get("ep_next")
-        chance = player.get("chance_of_playing_next_round")
+        # FPL ep_next is explicitly only for the official next GW. Never leak/reuse
+        # it for later horizons. Dastan's missing-value contract uses -1.
+        raw_ep = player.get("ep_next") if gameweek == official_next_gameweek else None
+        chance = (
+            player.get("chance_of_playing_next_round")
+            if gameweek == official_next_gameweek
+            else None
+        )
 
         ep_rows.append({
             "season": ACTIVE_SEASON,
             "gameweek": int(gameweek),
             "fpl_code": fpl_code,
-            "ep_next": np.nan if raw_ep in (None, "") else float(raw_ep),
+            "ep_next": -1.0 if raw_ep in (None, "") else float(raw_ep),
         })
 
         signal_rows.append({
@@ -736,7 +743,158 @@ def _roster_diagnostics(current_roster: pd.DataFrame) -> list[dict]:
     return search[cols].to_dict("records")
 
 
+def _score_target_gameweek(
+    *,
+    root: Path,
+    raw_dir: Path,
+    output_dir: Path,
+    bootstrap: dict,
+    fixtures: list[dict],
+    current_roster: pd.DataFrame,
+    base_player_matches: pd.DataFrame,
+    base_team_matches: pd.DataFrame,
+    gameweek: int,
+    official_next_gameweek: int,
+) -> tuple[pd.DataFrame, dict]:
+    """Score one future GW from the same observed history.
+
+    Critical rule: each horizon is built independently. Synthetic GW4 rows are
+    never allowed to become 'history' for GW5, etc.
+    """
+    event = next((e for e in bootstrap["events"] if int(e["id"]) == int(gameweek)), None)
+    if event is None:
+        raise RuntimeError(f"Official FPL bootstrap has no GW{gameweek} event.")
+    deadline = pd.to_datetime(event["deadline_time"], utc=True)
+
+    future_players = _future_player_rows(
+        base_player_matches.copy(), bootstrap, fixtures, gameweek
+    )
+    future_teams = _future_team_rows(
+        base_team_matches.copy(), bootstrap, fixtures, gameweek
+    )
+
+    player_matches = pd.concat(
+        [base_player_matches.copy(), future_players], ignore_index=True, sort=False
+    )
+    team_matches = pd.concat(
+        [base_team_matches.copy(), future_teams], ignore_index=True, sort=False
+    )
+    del future_players, future_teams
+    gc.collect()
+
+    player_matches = _carry_understat_identity_and_history_into_live_rows(
+        player_matches, ACTIVE_SEASON, gameweek
+    )
+    frame = features.build_feature_frame(player_matches, team_matches)
+    del player_matches, team_matches
+    gc.collect()
+
+    live_frame = frame[
+        frame["season"].eq(ACTIVE_SEASON)
+        & frame["gameweek"].eq(gameweek)
+    ].copy()
+    del frame
+    gc.collect()
+    if live_frame.empty:
+        raise RuntimeError(f"Feature builder produced no rows for GW{gameweek}.")
+
+    gw_dir = output_dir / f"gw{gameweek}"
+    gw_dir.mkdir(parents=True, exist_ok=True)
+    live_frame.to_parquet(gw_dir / "features.parquet", index=False)
+    _write_live_snapshot_artifacts(
+        gw_dir, bootstrap, gameweek, official_next_gameweek
+    )
+
+    scored_frame = data.load(data_dir=gw_dir, check_rows=False)
+    scored_frame = _restrict_scoring_frame_to_current_roster(
+        scored_frame, current_roster
+    )
+    fixture_validation = _validate_live_fixtures(
+        scored_frame, bootstrap, fixtures, gameweek
+    )
+
+    model = predictor.Dastan()
+    predictions = model.predict_frame(scored_frame, with_parts=True)
+    predictions["element"] = pd.to_numeric(
+        predictions["element"], errors="coerce"
+    ).astype("Int64")
+
+    for col in [
+        "player", "player_name", "web_name", "team", "team_name",
+        "current_team_name", "position", "price",
+    ]:
+        if col in predictions.columns:
+            predictions = predictions.drop(columns=[col])
+
+    publish_roster = current_roster[[
+        "element", "fpl_code_current", "player_name_current",
+        "current_team_name", "position_current", "price_current",
+    ]].copy()
+    predictions = predictions.merge(
+        publish_roster, on="element", how="inner", validate="many_to_one"
+    )
+
+    pred_codes = pd.to_numeric(predictions["fpl_code"], errors="coerce").astype("Int64")
+    roster_codes = pd.to_numeric(
+        predictions["fpl_code_current"], errors="coerce"
+    ).astype("Int64")
+    if pred_codes.ne(roster_codes).any():
+        raise RuntimeError(f"Current-roster identity mismatch while scoring GW{gameweek}.")
+
+    predictions = predictions.rename(columns={
+        "player_name_current": "player",
+        "current_team_name": "team",
+        "position_current": "position",
+        "price_current": "price",
+    })
+    predictions["forecast_gameweek"] = int(gameweek)
+    predictions.to_parquet(gw_dir / "predictions.parquet", index=False)
+
+    top = (
+        predictions.groupby(
+            ["fpl_code", "player", "team", "position", "price"],
+            dropna=False, as_index=False,
+        )
+        .agg(
+            xpts=("xpts", "sum"),
+            expected_minutes=("expected_minutes", "sum"),
+            p60=("p60", "max"),
+            fixtures=("fixture", "nunique"),
+            fixture_ids=("fixture", lambda x: sorted(set(int(v) for v in x.dropna()))),
+        )
+        .sort_values("xpts", ascending=False)
+        .reset_index(drop=True)
+    )
+    top["gameweek"] = int(gameweek)
+    top.to_parquet(gw_dir / "predictions_player_gw.parquet", index=False)
+
+    audit = {
+        "gameweek": int(gameweek),
+        "deadline": deadline.isoformat(),
+        "players": int(len(top)),
+        "fixture_rows": int(len(predictions)),
+        "fixture_validation": fixture_validation,
+        "model_features": int(len(model.features)),
+        "top_10": [
+            {
+                "player": r.player, "team": r.team, "position": r.position,
+                "price": round(float(r.price), 1), "xpts": round(float(r.xpts), 2),
+                "expected_minutes": round(float(r.expected_minutes), 1),
+                "p60": round(float(r.p60), 3), "fixture_ids": r.fixture_ids,
+            }
+            for r in top.head(10).itertuples()
+        ],
+    }
+    return top, audit
+
+
 def run_live_predictions(root: Path | None = None) -> dict:
+    """Phase 1 multi-GW validation: score official next GW and the following GW.
+
+    We intentionally start with two horizons. If GW4 remains identical to the
+    validated baseline and GW5 is sane, the same independent-horizon path can
+    safely be extended to Next 5 / Next 10.
+    """
     root = Path(root) if root is not None else Path(__file__).resolve().parent
     raw_dir = root / ".cache" / "dastan-live-raw"
     output_dir = root / "data" / "live"
@@ -746,20 +904,16 @@ def run_live_predictions(root: Path | None = None) -> dict:
     fixtures = _get_json(FPL_FIXTURES_URL)
     current_roster = _current_roster(bootstrap)
     next_event = _next_gameweek(bootstrap)
-    gameweek = int(next_event["id"])
-    deadline = pd.to_datetime(next_event["deadline_time"], utc=True)
+    next_gw = int(next_event["id"])
     now = pd.Timestamp.now(tz="UTC")
-
-    if now >= deadline:
+    next_deadline = pd.to_datetime(next_event["deadline_time"], utc=True)
+    if now >= next_deadline:
         raise RuntimeError(
-            f"GW{gameweek} deadline has already passed ({deadline.isoformat()})."
+            f"GW{next_gw} deadline has already passed ({next_deadline.isoformat()})."
         )
 
-    print(
-        f"Live Dastan: building {ACTIVE_SEASON} GW{gameweek} "
-        f"(deadline {deadline.isoformat()})",
-        flush=True,
-    )
+    targets = [next_gw, next_gw + 1]
+    print(f"Multi-GW phase 1: independently scoring {targets}", flush=True)
 
     with _live_operational_mapping_mode():
         sources.download_sources(
@@ -769,228 +923,74 @@ def run_live_predictions(root: Path | None = None) -> dict:
             force=False,
             allow_missing_understat=True,
         )
-
-        player_matches, team_matches, _ = sources.build_canonical_matches(
-            raw_dir,
-            HISTORY_SEASONS,
+        base_player_matches, base_team_matches, _ = sources.build_canonical_matches(
+            raw_dir, HISTORY_SEASONS
         )
 
-    future_players = _future_player_rows(
-        player_matches,
-        bootstrap,
-        fixtures,
-        gameweek,
-    )
-    future_teams = _future_team_rows(
-        team_matches,
-        bootstrap,
-        fixtures,
-        gameweek,
-    )
-
-    player_matches = pd.concat(
-        [player_matches, future_players],
-        ignore_index=True,
-        sort=False,
-    )
-    team_matches = pd.concat(
-        [team_matches, future_teams],
-        ignore_index=True,
-        sort=False,
-    )
-
-    del future_teams
-    gc.collect()
-
-    player_matches = _carry_understat_identity_and_history_into_live_rows(
-        player_matches,
-        ACTIVE_SEASON,
-        gameweek,
-    )
-
-    frame = features.build_feature_frame(
-        player_matches,
-        team_matches,
-    )
-
-    del player_matches
-    del team_matches
-    gc.collect()
-
-    live_frame = frame[
-        frame["season"].eq(ACTIVE_SEASON)
-        & frame["gameweek"].eq(gameweek)
-    ].copy()
-
-    if live_frame.empty:
-        raise RuntimeError(f"Feature builder produced no rows for GW{gameweek}.")
-
-    live_frame.to_parquet(
-        output_dir / "features.parquet",
-        index=False,
-    )
-    _write_live_snapshot_artifacts(
-        output_dir,
-        bootstrap,
-        gameweek,
-    )
-
-    scored_frame = data.load(
-        data_dir=output_dir,
-        check_rows=False,
-    )
-
-    scored_frame = _restrict_scoring_frame_to_current_roster(
-        scored_frame,
-        current_roster,
-    )
-    fixture_validation = _validate_live_fixtures(
-        scored_frame,
-        bootstrap,
-        fixtures,
-        gameweek,
-    )
-
-    model = predictor.Dastan()
-    predictions = model.predict_frame(
-        scored_frame,
-        with_parts=True,
-    )
-
-    # Publish ONLY metadata from the fresh official FPL roster.
-    predictions["element"] = pd.to_numeric(
-        predictions["element"], errors="coerce"
-    ).astype("Int64")
-
-    # Remove every display field that may have leaked from historical rebuild data.
-    for col in [
-        "player",
-        "player_name",
-        "web_name",
-        "team",
-        "team_name",
-        "current_team_name",
-        "position",
-        "price",
-    ]:
-        if col in predictions.columns:
-            predictions = predictions.drop(columns=[col])
-
-    publish_roster = current_roster[
-        [
-            "element",
-            "fpl_code_current",
-            "player_name_current",
-            "current_team_name",
-            "position_current",
-            "price_current",
-        ]
-    ].copy()
-
-    predictions = predictions.merge(
-        publish_roster,
-        on="element",
-        how="inner",
-        validate="many_to_one",
-    )
-
-    pred_codes = pd.to_numeric(
-        predictions["fpl_code"], errors="coerce"
-    ).astype("Int64")
-    roster_codes = pd.to_numeric(
-        predictions["fpl_code_current"], errors="coerce"
-    ).astype("Int64")
-
-    mismatch = pred_codes.ne(roster_codes)
-    if mismatch.any():
-        examples = (
-            predictions.loc[
-                mismatch,
-                ["element", "fpl_code", "fpl_code_current", "player_name_current"],
-            ]
-            .head(10)
-            .to_dict("records")
+    all_tops = []
+    audits = []
+    for gw in targets:
+        print(f"Multi-GW phase 1: scoring GW{gw}", flush=True)
+        top, audit = _score_target_gameweek(
+            root=root,
+            raw_dir=raw_dir,
+            output_dir=output_dir,
+            bootstrap=bootstrap,
+            fixtures=fixtures,
+            current_roster=current_roster,
+            base_player_matches=base_player_matches,
+            base_team_matches=base_team_matches,
+            gameweek=gw,
+            official_next_gameweek=next_gw,
         )
-        raise RuntimeError(
-            "Current-roster identity mismatch after scoring. "
-            f"Examples: {examples}"
-        )
+        all_tops.append(top)
+        audits.append(audit)
+        gc.collect()
 
-    predictions = predictions.rename(
-        columns={
-            "player_name_current": "player",
-            "current_team_name": "team",
-            "position_current": "position",
-            "price_current": "price",
-        }
+    combined = pd.concat(all_tops, ignore_index=True, sort=False)
+    combined.to_parquet(output_dir / "predictions_multi_gw.parquet", index=False)
+
+    # Preserve the existing API contract: current-GW endpoint still reads this file.
+    current_top = all_tops[0].copy()
+    current_top.to_parquet(
+        output_dir / "predictions_player_gw.parquet", index=False
     )
 
-    predictions.to_parquet(
-        output_dir / "predictions.parquet",
-        index=False,
-    )
-
-    top = (
-        predictions.groupby(
-            ["fpl_code", "player", "team", "position", "price"],
-            dropna=False,
-            as_index=False,
-        )
-        .agg(
-            xpts=("xpts", "sum"),
-            expected_minutes=("expected_minutes", "sum"),
-            p60=("p60", "max"),
-            fixtures=("fixture", "nunique"),
-            fixture_ids=("fixture", lambda s: sorted(set(int(x) for x in s.dropna()))),
-        )
-        .sort_values("xpts", ascending=False)
-        .reset_index(drop=True)
-    )
-
-    top.to_parquet(
-        output_dir / "predictions_player_gw.parquet",
-        index=False,
-    )
-
-    model_team_feature_audit = _model_team_feature_audit(
-        scored_frame,
-        model,
-        current_roster,
-    )
-
-    feature_audit = _live_feature_audit(
-        scored_frame,
-        predictions,
-        current_roster,
-    )
+    # Compact comparison for the players we have been using as integrity checks.
+    watch = {"João Pedro", "Rogers", "Haaland", "Palmer", "Gabriel", "Saka"}
+    comparison = []
+    for name in watch:
+        rows = combined[combined["player"].eq(name)].sort_values("gameweek")
+        if rows.empty:
+            continue
+        comparison.append({
+            "player": name,
+            "team": str(rows.iloc[0]["team"]),
+            "gameweeks": {
+                str(int(r.gameweek)): {
+                    "xpts": round(float(r.xpts), 3),
+                    "expected_minutes": round(float(r.expected_minutes), 1),
+                    "p60": round(float(r.p60), 3),
+                    "fixture_ids": r.fixture_ids,
+                }
+                for r in rows.itertuples()
+            },
+        })
 
     return {
         "status": "ok",
+        "mode": "multi_gw_phase_1",
         "season": ACTIVE_SEASON,
-        "gameweek": gameweek,
-        "deadline": deadline.isoformat(),
+        "official_next_gameweek": next_gw,
+        "forecast_gameweeks": targets,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "players": int(len(top)),
-        "fixture_rows": int(len(predictions)),
-        "scored_current_roster_rows": int(len(scored_frame)),
-        "fixture_validation": fixture_validation,
-        "feature_audit": feature_audit,
-        "model_team_feature_audit": model_team_feature_audit,
-        "model_features": int(len(model.features)),
         "official_fpl_roster_players": int(len(current_roster)),
-        "official_fpl_teams": sorted(current_roster["current_team_name"].dropna().unique().tolist()),
-        "official_fpl_diagnostics": _roster_diagnostics(current_roster),
-        "top_10": [
-            {
-                "player": row.player,
-                "team": row.team,
-                "position": row.position,
-                "price": round(float(row.price), 1),
-                "xpts": round(float(row.xpts), 2),
-                "expected_minutes": round(float(row.expected_minutes), 1),
-                "p60": round(float(row.p60), 3),
-                "fixture_ids": row.fixture_ids,
-            }
-            for row in top.head(10).itertuples()
-        ],
+        "gameweek_audits": audits,
+        "comparison": comparison,
+        "safety": {
+            "independent_horizons": True,
+            "future_rows_used_as_history": False,
+            "ep_next_used_only_for_official_next_gw": True,
+            "later_gw_ep_next_missing_value": -1.0,
+        },
     }
