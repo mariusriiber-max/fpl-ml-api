@@ -392,21 +392,34 @@ def live_status():
 # --- Base44 production endpoint: Dastan current-GW predictions ---
 @app.get("/api/dastan/predictions")
 def dastan_predictions():
-    """Return the latest successfully generated live Dastan player-GW predictions."""
+    """Production API for Dastan Next GW, Next 5 and Next 10 predictions."""
     try:
-        live_file = Path(__file__).resolve().parent / "data" / "live" / "predictions_player_gw.parquet"
-        if not live_file.exists():
+        summary_file = (
+            Path(__file__).resolve().parent
+            / "data"
+            / "live"
+            / "predictions_multi_gw_summary.parquet"
+        )
+
+        if not summary_file.exists():
             return jsonify({
                 "status": "not_ready",
-                "error": "No live Dastan prediction file exists yet."
+                "error": "No live multi-GW Dastan predictions exist yet."
             }), 503
 
-        df = pd.read_parquet(live_file)
+        df = pd.read_parquet(summary_file)
 
         required = {
-            "fpl_code", "player", "team", "position", "price",
-            "xpts", "expected_minutes", "p60", "fixtures"
+            "fpl_code",
+            "player",
+            "team",
+            "position",
+            "price",
+            "next_gw_xpts",
+            "next_5_xpts",
+            "next_10_xpts",
         }
+
         missing = sorted(required - set(df.columns))
         if missing:
             return jsonify({
@@ -414,9 +427,10 @@ def dastan_predictions():
                 "error": f"Prediction file is missing columns: {missing}"
             }), 500
 
-        df = df.sort_values("xpts", ascending=False).copy()
+        df = df.sort_values("next_gw_xpts", ascending=False).copy()
 
         players = []
+
         for rank, row in enumerate(df.itertuples(index=False), start=1):
             players.append({
                 "rank": rank,
@@ -425,10 +439,10 @@ def dastan_predictions():
                 "team": str(row.team),
                 "position": str(row.position),
                 "price": round(float(row.price), 1),
-                "xpts": round(float(row.xpts), 3),
-                "expected_minutes": round(float(row.expected_minutes), 1),
-                "p60": round(float(row.p60), 4),
-                "fixtures": int(row.fixtures),
+
+                "next_gw_xpts": round(float(row.next_gw_xpts), 3),
+                "next_5_xpts": round(float(row.next_5_xpts), 3),
+                "next_10_xpts": round(float(row.next_10_xpts), 3),
             })
 
         return jsonify({
