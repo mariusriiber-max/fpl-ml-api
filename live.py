@@ -889,11 +889,10 @@ def _score_target_gameweek(
 
 
 def run_live_predictions(root: Path | None = None) -> dict:
-    """Phase 1 multi-GW validation: score official next GW and the following GW.
+    """Production multi-GW forecast: independently score Next GW through Next 10.
 
-    We intentionally start with two horizons. If GW4 remains identical to the
-    validated baseline and GW5 is sane, the same independent-horizon path can
-    safely be extended to Next 5 / Next 10.
+    Every future gameweek is built from the same observed historical base.
+    Synthetic rows from earlier future GWs are never reused as history.
     """
     root = Path(root) if root is not None else Path(__file__).resolve().parent
     raw_dir = root / ".cache" / "dastan-live-raw"
@@ -907,13 +906,18 @@ def run_live_predictions(root: Path | None = None) -> dict:
     next_gw = int(next_event["id"])
     now = pd.Timestamp.now(tz="UTC")
     next_deadline = pd.to_datetime(next_event["deadline_time"], utc=True)
+
     if now >= next_deadline:
         raise RuntimeError(
             f"GW{next_gw} deadline has already passed ({next_deadline.isoformat()})."
         )
 
-    targets = [next_gw, next_gw + 1]
-    print(f"Multi-GW phase 1: independently scoring {targets}", flush=True)
+    # Next GW + the following nine gameweeks.
+    targets = list(range(next_gw, min(next_gw + 10, 39)))
+    if not targets:
+        raise RuntimeError("No future gameweeks available to forecast.")
+
+    print(f"Multi-GW production: independently scoring {targets}", flush=True)
 
     with _live_operational_mapping_mode():
         sources.download_sources(
@@ -929,8 +933,9 @@ def run_live_predictions(root: Path | None = None) -> dict:
 
     all_tops = []
     audits = []
+
     for gw in targets:
-        print(f"Multi-GW phase 1: scoring GW{gw}", flush=True)
+        print(f"Multi-GW production: scoring GW{gw}", flush=True)
         top, audit = _score_target_gameweek(
             root=root,
             raw_dir=raw_dir,
@@ -948,24 +953,106 @@ def run_live_predictions(root: Path | None = None) -> dict:
         gc.collect()
 
     combined = pd.concat(all_tops, ignore_index=True, sort=False)
-    combined.to_parquet(output_dir / "predictions_multi_gw.parquet", index=False)
-
-    # Preserve the existing API contract: current-GW endpoint still reads this file.
-    current_top = all_tops[0].copy()
-    current_top.to_parquet(
-        output_dir / "predictions_player_gw.parquet", index=False
+    combined = combined.sort_values(
+        ["fpl_code", "gameweek"], kind="stable"
+    ).reset_index(drop=True)
+    combined.to_parquet(
+        output_dir / "predictions_multi_gw.parquet",
+        index=False,
     )
 
-    # Compact comparison for the players we have been using as integrity checks.
+    # Preserve the existing single-GW API contract.
+    current_top = combined[combined["gameweek"].eq(next_gw)].copy()
+    current_top.to_parquet(
+        output_dir / "predictions_player_gw.parquet",
+        index=False,
+    )
+
+    # One row per current player with horizon totals.
+    identity = ["fpl_code", "player", "team", "position", "price"]
+    summary = (
+        combined.groupby(identity, dropna=False, as_index=False)
+        .agg(
+            next_5_xpts=(
+                "xpts",
+                lambda s: float(
+                    combined.loc[s.index]
+                    .loc[combined.loc[s.index, "gameweek"].isin(targets[:5]), "xpts"]
+                    .sum()
+                ),
+            ),
+            next_10_xpts=("xpts", "sum"),
+        )
+    )
+
+    # Add explicit per-GW xPts columns.
+    xpts_wide = (
+        combined.pivot_table(
+            index="fpl_code",
+            columns="gameweek",
+            values="xpts",
+            aggfunc="sum",
+        )
+        .rename(columns=lambda gw: f"gw{int(gw)}_xpts")
+        .reset_index()
+    )
+    summary = summary.merge(
+        xpts_wide,
+        on="fpl_code",
+        how="left",
+        validate="one_to_one",
+    )
+
+    # Expected-minutes horizon totals are useful for Base44 confidence/availability.
+    mins_wide = (
+        combined.pivot_table(
+            index="fpl_code",
+            columns="gameweek",
+            values="expected_minutes",
+            aggfunc="sum",
+        )
+        .rename(columns=lambda gw: f"gw{int(gw)}_expected_minutes")
+        .reset_index()
+    )
+    summary = summary.merge(
+        mins_wide,
+        on="fpl_code",
+        how="left",
+        validate="one_to_one",
+    )
+
+    summary["next_5_xpts"] = summary["next_5_xpts"].round(4)
+    summary["next_10_xpts"] = summary["next_10_xpts"].round(4)
+    summary = summary.sort_values(
+        "next_10_xpts", ascending=False
+    ).reset_index(drop=True)
+
+    summary.to_parquet(
+        output_dir / "predictions_multi_gw_summary.parquet",
+        index=False,
+    )
+
     watch = {"João Pedro", "Rogers", "Haaland", "Palmer", "Gabriel", "Saka"}
     comparison = []
+
     for name in watch:
         rows = combined[combined["player"].eq(name)].sort_values("gameweek")
         if rows.empty:
             continue
+
+        first_code = rows.iloc[0]["fpl_code"]
+        summary_row = summary[summary["fpl_code"].eq(first_code)]
         comparison.append({
             "player": name,
             "team": str(rows.iloc[0]["team"]),
+            "next_5_xpts": (
+                round(float(summary_row.iloc[0]["next_5_xpts"]), 3)
+                if not summary_row.empty else None
+            ),
+            "next_10_xpts": (
+                round(float(summary_row.iloc[0]["next_10_xpts"]), 3)
+                if not summary_row.empty else None
+            ),
             "gameweeks": {
                 str(int(r.gameweek)): {
                     "xpts": round(float(r.xpts), 3),
@@ -977,9 +1064,33 @@ def run_live_predictions(root: Path | None = None) -> dict:
             },
         })
 
+    top_next_5 = [
+        {
+            "player": r.player,
+            "team": r.team,
+            "position": r.position,
+            "price": round(float(r.price), 1),
+            "next_5_xpts": round(float(r.next_5_xpts), 2),
+        }
+        for r in summary.sort_values(
+            "next_5_xpts", ascending=False
+        ).head(10).itertuples()
+    ]
+
+    top_next_10 = [
+        {
+            "player": r.player,
+            "team": r.team,
+            "position": r.position,
+            "price": round(float(r.price), 1),
+            "next_10_xpts": round(float(r.next_10_xpts), 2),
+        }
+        for r in summary.head(10).itertuples()
+    ]
+
     return {
         "status": "ok",
-        "mode": "multi_gw_phase_1",
+        "mode": "multi_gw_production",
         "season": ACTIVE_SEASON,
         "official_next_gameweek": next_gw,
         "forecast_gameweeks": targets,
@@ -987,10 +1098,18 @@ def run_live_predictions(root: Path | None = None) -> dict:
         "official_fpl_roster_players": int(len(current_roster)),
         "gameweek_audits": audits,
         "comparison": comparison,
+        "top_next_5": top_next_5,
+        "top_next_10": top_next_10,
         "safety": {
             "independent_horizons": True,
             "future_rows_used_as_history": False,
             "ep_next_used_only_for_official_next_gw": True,
             "later_gw_ep_next_missing_value": -1.0,
         },
+        "output_files": {
+            "current_gw": "data/live/predictions_player_gw.parquet",
+            "all_gameweeks": "data/live/predictions_multi_gw.parquet",
+            "summary": "data/live/predictions_multi_gw_summary.parquet",
+        },
     }
+
