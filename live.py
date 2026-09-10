@@ -1021,6 +1021,10 @@ def run_live_predictions(root: Path | None = None) -> dict:
         validate="one_to_one",
     )
 
+    next_col = f"gw{next_gw}_xpts"
+    if next_col not in summary.columns:
+        raise RuntimeError(f"Missing expected current-GW summary column: {next_col}")
+    summary["next_gw_xpts"] = summary[next_col].round(4)
     summary["next_5_xpts"] = summary["next_5_xpts"].round(4)
     summary["next_10_xpts"] = summary["next_10_xpts"].round(4)
     summary = summary.sort_values(
@@ -1032,19 +1036,55 @@ def run_live_predictions(root: Path | None = None) -> dict:
         index=False,
     )
 
-    watch = {"João Pedro", "Rogers", "Haaland", "Palmer", "Gabriel", "Saka"}
+    # Diagnostics must use stable identity, never display name alone.
+    watch_specs = [
+        ("João Pedro", "Chelsea"),
+        ("Rogers", "Chelsea"),
+        ("Haaland", "Man City"),
+        ("Palmer", "Chelsea"),
+        ("Gabriel", "Arsenal"),
+        ("Saka", "Arsenal"),
+    ]
     comparison = []
 
-    for name in watch:
-        rows = combined[combined["player"].eq(name)].sort_values("gameweek")
-        if rows.empty:
+    for player_name, team_name in watch_specs:
+        roster_match = current_roster.loc[
+            current_roster["player_name_current"].eq(player_name)
+            & current_roster["current_team_name"].eq(team_name)
+        ]
+
+        if len(roster_match) != 1:
+            comparison.append({
+                "player": player_name,
+                "team": team_name,
+                "identity_status": "not_unique",
+                "matches_found": int(len(roster_match)),
+            })
             continue
 
-        first_code = rows.iloc[0]["fpl_code"]
-        summary_row = summary[summary["fpl_code"].eq(first_code)]
+        fpl_code = int(roster_match.iloc[0]["fpl_code_current"])
+        rows = combined[
+            pd.to_numeric(combined["fpl_code"], errors="coerce").eq(fpl_code)
+        ].sort_values("gameweek")
+
+        if rows.empty:
+            comparison.append({
+                "player": player_name,
+                "team": team_name,
+                "fpl_code": fpl_code,
+                "identity_status": "missing_from_forecast",
+            })
+            continue
+
+        summary_row = summary[
+            pd.to_numeric(summary["fpl_code"], errors="coerce").eq(fpl_code)
+        ]
+
         comparison.append({
-            "player": name,
-            "team": str(rows.iloc[0]["team"]),
+            "player": player_name,
+            "team": team_name,
+            "fpl_code": fpl_code,
+            "identity_status": "ok",
             "next_5_xpts": (
                 round(float(summary_row.iloc[0]["next_5_xpts"]), 3)
                 if not summary_row.empty else None
